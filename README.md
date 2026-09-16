@@ -8,6 +8,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 - Allowlist-based user filtering via TELEGRAM_ALLOWED_USER_IDS
 - Conversational chat backed by a local llama.cpp / OpenAI-compatible API
 - Context retention with configurable message history window
+- Bounded model responses (max_tokens, character truncation)
 - System prompt support: global and per-user private prompts
 - Rate limiting between model requests
 - Health status and conversation history commands
@@ -39,7 +40,7 @@ Set the following environment variables (documented in .env.example):
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
 - MAX_CONTEXT_MESSAGES -- Max conversation history messages per user. Default: 20.
-- MAX_MESSAGE_CHARS -- Max characters per message. Default: 8000.
+- MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000.
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 
 ## Usage

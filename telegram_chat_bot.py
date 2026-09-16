@@ -34,7 +34,12 @@ class Settings:
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
-    payload = json.dumps({"model": settings.model, "messages": messages, "temperature": 0.7}).encode()
+    payload = json.dumps({
+        "model": settings.model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": settings.max_chars,
+    }).encode()
     request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
                       headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -43,8 +48,8 @@ def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
         text = data["choices"][0]["message"].get("content", "").strip()
         if not text:
             raise ValueError("empty model response")
-        return text
-    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        return text[: settings.max_chars]
+    except (HTTPError, URLError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError("model request failed") from exc
 
 

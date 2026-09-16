@@ -153,3 +153,43 @@ def test_complete_json_error(mock_urlopen):
     messages = [{'role': 'user', 'content': 'Test message'}]
     with pytest.raises(RuntimeError, match='model request failed'):
         complete(settings, messages)
+
+
+@patch('telegram_chat_bot.urlopen')
+def test_complete_max_tokens_in_payload(mock_urlopen):
+    # Verify max_tokens is included in the request payload
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({
+        'choices': [{'message': {'content': 'ok'}}]
+    }).encode()
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    settings = Settings(token='test_token')
+    messages = [{'role': 'user', 'content': 'Test'}]
+    result = complete(settings, messages)
+    assert result == 'ok'
+
+    # Check the payload was sent with max_tokens
+    called_request = mock_urlopen.call_args[0][0]
+    payload = json.loads(called_request.data)
+    assert payload['max_tokens'] == settings.max_chars
+    assert payload['model'] == settings.model
+    assert payload['messages'] == messages
+    assert payload['temperature'] == 0.7
+
+
+@patch('telegram_chat_bot.urlopen')
+def test_complete_response_truncation(mock_urlopen):
+    # Verify response is truncated to max_chars
+    settings = Settings(token='test_token')
+    long_content = 'x' * (settings.max_chars + 100)
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({
+        'choices': [{'message': {'content': long_content}}]
+    }).encode()
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    messages = [{'role': 'user', 'content': 'Test'}]
+    result = complete(settings, messages)
+    assert len(result) == settings.max_chars
+    assert result == 'x' * settings.max_chars
