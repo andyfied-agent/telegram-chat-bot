@@ -67,6 +67,8 @@ python bot.py
 The `/status` and `/shutdown` commands are available only through private Telegram messages; shutdown is intentionally refused remotely.
 Set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram numeric user IDs; if it is unset, all Telegram users are rejected.
 
+For a persistent user service, copy `telegram-chat-bot.service.example` to `~/.config/systemd/user/telegram-chat-bot.service`, create `~/.config/telegram-chat-bot/env` with mode `600`, and run `systemctl --user enable --now telegram-chat-bot`. Never commit the environment file or bot token.
+
 ## Development
 
 For development, use the isolated environment created by `install.sh`:

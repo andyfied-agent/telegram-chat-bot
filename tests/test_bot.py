@@ -3,8 +3,6 @@ from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 import pytest
-from telegram import Message, Update, User
-from telegram.ext import ContextTypes
 
 from telegram_chat_bot import State, Settings, complete, private
 

@@ -21,7 +21,7 @@ cd "$SCRIPT_DIR"
 echo "Creating isolated virtual environment..."
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.lock
 
 echo "Installation complete!"
 echo "To use the bot:"

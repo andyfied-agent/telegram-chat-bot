@@ -10,6 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements.txt pytest==8.4.2
+      - run: python -m pip install -r requirements.lock -r requirements-dev.txt
       - run: python -m pytest -q tests
+      - run: python -m ruff check telegram_chat_bot.py tests
       - run: python -m py_compile telegram-chat-bot.py
