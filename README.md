@@ -27,6 +27,7 @@ A Telegram chat bot backed by a local Ministral llama.cpp server that responds o
    - Copy the token and set it as an environment variable:
      ```
    export TELEGRAM_TOKEN="your_token_here"
+   export TELEGRAM_ALLOWED_USER_IDS="123456789"
    export LLAMA_CPP_BASE_URL="http://127.0.0.1:11438/v1"
      ```
 
@@ -64,6 +65,7 @@ python bot.py
 ```
 
 The `/status` and `/shutdown` commands are available only through private Telegram messages; shutdown is intentionally refused remotely.
+Set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram numeric user IDs; if it is unset, all Telegram users are rejected.
 
 ## Development
 

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
@@ -26,6 +27,10 @@ class Settings:
     timeout: float = field(default_factory=lambda: float(os.getenv("LLAMA_CPP_TIMEOUT", "120")))
     max_messages: int = field(default_factory=lambda: int(os.getenv("MAX_CONTEXT_MESSAGES", "20")))
     max_chars: int = field(default_factory=lambda: int(os.getenv("MAX_MESSAGE_CHARS", "8000")))
+    allowed_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
+        int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if value.strip()
+    ))
+    request_interval: float = field(default_factory=lambda: float(os.getenv("MODEL_REQUEST_INTERVAL", "1.0")))
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
@@ -51,6 +56,11 @@ class State:
         )
         self.global_prompt = ""
         self.private_prompts: dict[int, str] = {}
+        self.last_request: dict[int, float] = {}
+        self.request_gate = asyncio.Semaphore(1)
+
+    def allowed(self, user_id: int) -> bool:
+        return user_id in self.settings.allowed_user_ids
 
     def messages(self, user_id: int) -> list[dict[str, str]]:
         prompt = self.global_prompt
@@ -66,27 +76,37 @@ def private() -> filters.BaseFilter:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application.bot_data["state"].allowed(update.effective_user.id):
+        return
     await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
     await update.message.reply_text(f"Running {state.settings.model}; retaining up to {state.settings.max_messages} messages.")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
     state.history.pop(update.effective_user.id, None)
     await update.message.reply_text("Your conversation context has been reset.")
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
     await update.message.reply_text(f"I retain {len(state.history[update.effective_user.id])} recent messages in memory for this chat.")
 
 
 async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
     prompt = " ".join(context.args).strip()
     if not prompt:
         await update.message.reply_text("Usage: /addglobalprompt <prompt>")
@@ -97,6 +117,8 @@ async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
     prompt = " ".join(context.args).strip()
     if not prompt:
         await update.message.reply_text("Usage: /addprivateprompt <prompt>")
@@ -106,10 +128,14 @@ async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application.bot_data["state"].allowed(update.effective_user.id):
+        return
     await update.message.reply_text("Shutdown from Telegram is disabled; stop the local service instead.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application.bot_data["state"].allowed(update.effective_user.id):
+        return
     await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /help")
 
 
@@ -117,13 +143,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
     state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.allowed(user_id):
+        return
     text = (update.message.text or "").strip()[: state.settings.max_chars]
     if not text:
         return
-    user_id = update.effective_user.id
+    now = time.monotonic()
+    if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
+        await update.message.reply_text("Please wait a moment before sending another message.")
+        return
+    state.last_request[user_id] = now
     state.history[user_id].append({"role": "user", "content": text})
     try:
-        response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
+        async with state.request_gate:
+            response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
     except RuntimeError:
         state.history[user_id].pop()
         logger.exception("llama.cpp request failed for user %s", user_id)

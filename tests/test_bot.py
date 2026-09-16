@@ -23,6 +23,7 @@ def test_settings_defaults():
     assert settings.timeout == 120.0
     assert settings.max_messages == 20
     assert settings.max_chars == 8000
+    assert settings.allowed_user_ids == frozenset()
 
 
 def test_settings_custom():
@@ -33,6 +34,7 @@ def test_settings_custom():
         'LLAMA_CPP_TIMEOUT': '300',
         'MAX_CONTEXT_MESSAGES': '10',
         'MAX_MESSAGE_CHARS': '4000'
+        ,'TELEGRAM_ALLOWED_USER_IDS': '123, 456'
     }):
         settings = Settings(token='test_token')
         assert settings.base_url == 'http://localhost:8080/v1'
@@ -40,6 +42,7 @@ def test_settings_custom():
         assert settings.timeout == 300.0
         assert settings.max_messages == 10
         assert settings.max_chars == 4000
+        assert settings.allowed_user_ids == frozenset({123, 456})
 
 
 def test_state_initialization():
@@ -50,6 +53,14 @@ def test_state_initialization():
     assert isinstance(state.history, dict)
     assert state.global_prompt == ''
     assert isinstance(state.private_prompts, dict)
+    assert not state.allowed(123)
+
+
+def test_allowlist():
+    with patch.dict('os.environ', {'TELEGRAM_ALLOWED_USER_IDS': '123'}):
+        state = State(Settings(token='test_token'))
+    assert state.allowed(123)
+    assert not state.allowed(456)
 
 
 def test_state_messages():
