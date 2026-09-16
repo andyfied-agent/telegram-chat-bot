@@ -15,7 +15,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 ## Requirements
 
 - Python 3.10+
-- A running llama.cpp OpenAI-compatible server (e.g. ollama) serving a Ministral model
+- A running llama.cpp OpenAI-compatible server serving a Ministral model
   - Default model: ministral-3-3b-64k-q4_k_m.gguf
   - Default URL: http://127.0.0.1:11438/v1
 
@@ -109,6 +109,7 @@ The service unit telegram-chat-bot.service.example can be deployed as a user ser
 
 2. Create an environment file (never commit or push this file):
    mkdir -p ~/.config/telegram-chat-bot
+   touch ~/.config/telegram-chat-bot/env
    chmod 600 ~/.config/telegram-chat-bot/env
    Add variables (at minimum TELEGRAM_TOKEN) to ~/.config/telegram-chat-bot/env.
 
