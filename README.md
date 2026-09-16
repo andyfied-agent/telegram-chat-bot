@@ -17,9 +17,9 @@ A Telegram chat bot running on Ministral that responds only to direct messages. 
    git clone https://github.com/andyfied-Thargoid/telegram-chat-bot.git
    ```
 
-2. Install dependencies:
+2. Run the install script:
    ```
-   pip install python-telegram-bot
+   ./install.sh
    ```
 
 3. Set up your Telegram bot token:
@@ -33,7 +33,7 @@ A Telegram chat bot running on Ministral that responds only to direct messages. 
 
 To start the bot:
 ```
-python telegram-chat-bot.py
+./telegram-chat-bot.sh
 ```
 
 ### Commands
