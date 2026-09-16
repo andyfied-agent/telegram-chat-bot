@@ -115,6 +115,8 @@ Test coverage includes:
 - State initialization and allowlisting
 - Message assembly with global + private prompts
 - Successful, empty, HTTP error, and JSON decode error paths in complete()
+- handle_message rejecting an unallowlisted user
+- handle_message ignoring a non-private chat
 
 ## systemd Deployment
 

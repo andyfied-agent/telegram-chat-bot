@@ -286,3 +286,50 @@ def test_chunk_single_chunk_preserved():
     text = 'c' * 2000
     chunks = _chunk(text)
     assert chunks == [text]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_rejects_unallowlisted_user():
+    """handle_message must return early without any reply when user is not allowlisted."""
+    from telegram_chat_bot import handle_message
+
+    # No env set → allowed_user_ids is empty → everyone rejected
+    settings = Settings(token='test_token')
+    state = State(settings)
+
+    mock_update = MagicMock()
+    mock_update.effective_chat.type = "private"
+    mock_update.effective_user.id = 999
+    mock_update.message.text = "hello"
+    mock_update.message.reply_text = MagicMock()
+
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+
+    await handle_message(mock_update, mock_context)
+
+    # No reply should have been sent
+    mock_update.message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_ignores_non_private_chat():
+    """handle_message must ignore group/supergroup/channel messages entirely."""
+    from telegram_chat_bot import handle_message
+
+    settings = Settings(token='test_token')
+    state = State(settings)
+
+    mock_update = MagicMock()
+    mock_update.effective_chat.type = "group"
+    mock_update.effective_user.id = 123
+    mock_update.message.text = "hello"
+    mock_update.message.reply_text = MagicMock()
+
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+
+    await handle_message(mock_update, mock_context)
+
+    # No reply should have been sent
+    mock_update.message.reply_text.assert_not_called()
