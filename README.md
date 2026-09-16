@@ -33,7 +33,7 @@ A Telegram chat bot running on Ministral that responds only to direct messages. 
 
 To start the bot:
 ```
-python bot.py
+python telegram-chat-bot.py
 ```
 
 ### Commands
