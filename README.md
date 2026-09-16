@@ -43,6 +43,7 @@ Set the following environment variables (documented in .env.example):
 
 - TELEGRAM_TOKEN -- Bot token from @BotFather on Telegram (required).
 - TELEGRAM_ALLOWED_USER_IDS -- Comma-separated Telegram numeric user IDs. If unset or empty, all Telegram users are rejected.
+- TELEGRAM_ADMIN_USER_IDS -- Comma-separated Telegram numeric user IDs with authority to change the global prompt. If unset or empty, the /addglobalprompt command is denied to all users.
 - LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:11438/v1.
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
@@ -81,6 +82,7 @@ Shutdown via Telegram is intentionally disabled. Stop the bot by terminating the
 - Allowlisting: TELEGRAM_ALLOWED_USER_IDS must be set to a comma-separated list of Telegram user IDs. Every command and message is checked against this list; unlisted users receive no response.
 - Private-only: All handlers use filters.ChatType.PRIVATE; group messages are silently ignored.
 - Remote shutdown disabled: The /shutdown command returns a polite refusal and suggests stopping the systemd service.
+- Admin authorization: TELEGRAM_ADMIN_USER_IDS authorizes users who may use /addglobalprompt. /addprivateprompt and chat still require TELEGRAM_ALLOWED_USER_IDS. If TELEGRAM_ADMIN_USER_IDS is unset or empty, no user can change the global prompt.
 
 ## Real Commands in Code
 

@@ -193,3 +193,32 @@ def test_complete_response_truncation(mock_urlopen):
     result = complete(settings, messages)
     assert len(result) == settings.max_chars
     assert result == 'x' * settings.max_chars
+
+
+def test_admin_user_ids():
+    with patch.dict('os.environ', {'TELEGRAM_ADMIN_USER_IDS': '123'}):
+        state = State(Settings(token='test_token'))
+    assert state.admin(123)
+    assert not state.admin(456)
+    assert not state.admin(12345)
+
+
+def test_admin_empty():
+    # Empty admin list means nobody is admin
+    settings = Settings(token='test_token')
+    state = State(settings)
+    assert not state.admin(123)
+
+
+def test_admin_vs_allowed():
+    # An allowed user who is not admin cannot set global prompt
+    with patch.dict('os.environ', {
+        'TELEGRAM_ALLOWED_USER_IDS': '123',
+        'TELEGRAM_ADMIN_USER_IDS': '456'
+    }):
+        settings = Settings(token='test_token')
+        state = State(settings)
+    assert state.allowed(123)
+    assert not state.admin(123)
+    assert not state.allowed(456)
+    assert state.admin(456)

@@ -30,6 +30,9 @@ class Settings:
     allowed_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if value.strip()
     ))
+    admin_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
+        int(value.strip()) for value in os.getenv("TELEGRAM_ADMIN_USER_IDS", "").split(",") if value.strip()
+    ))
     request_interval: float = field(default_factory=lambda: float(os.getenv("MODEL_REQUEST_INTERVAL", "1.0")))
 
 
@@ -66,6 +69,9 @@ class State:
 
     def allowed(self, user_id: int) -> bool:
         return user_id in self.settings.allowed_user_ids
+
+    def admin(self, user_id: int) -> bool:
+        return user_id in self.settings.admin_user_ids
 
     def messages(self, user_id: int) -> list[dict[str, str]]:
         prompt = self.global_prompt
@@ -110,7 +116,9 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
-    if not state.allowed(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not state.admin(user_id):
+        await update.message.reply_text("Only administrators can set the global prompt.")
         return
     prompt = " ".join(context.args).strip()
     if not prompt:
