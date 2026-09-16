@@ -32,9 +32,9 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 
    Or do it manually:
    python3 -m venv --without-pip .venv
-   curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
-   .venv/bin/python3 /tmp/get-pip.py
-   rm /tmp/get-pip.py
+   curl -sS --fail -o /tmp/get-pip.XXXXXX.py https://bootstrap.pypa.io/get-pip.py
+   .venv/bin/python3 /tmp/get-pip.XXXXXX.py
+   rm /tmp/get-pip.XXXXXX.py
    .venv/bin/python3 -m pip install -r requirements.lock
 
 ## Environment Variables

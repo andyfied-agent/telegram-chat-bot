@@ -26,10 +26,19 @@ else
         echo "ERROR: curl is required to bootstrap pip."
         exit 1
     fi
-    curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
-    .venv/bin/python3 /tmp/get-pip.py
-    rm /tmp/get-pip.py
+    # Use --fail so HTTP errors/redirects cause curl to exit non-zero.
+    # Write to a unique temp file and clean it up via trap.
+    tmpfile=$(mktemp /tmp/get-pip.XXXXXX.py)
+    trap 'rm -f "$tmpfile"' EXIT ERR INT TERM
+    if ! curl -sS --fail -o "$tmpfile" https://bootstrap.pypa.io/get-pip.py; then
+        echo "ERROR: Failed to download get-pip.py."
+        rm -f "$tmpfile"
+        exit 1
+    fi
+    .venv/bin/python3 "$tmpfile"
+    rm -f "$tmpfile"
     echo "pip installed."
+    trap - ERR INT TERM
 fi
 
 echo "Upgrading pip..."
@@ -43,6 +52,6 @@ echo "Installation complete!"
 echo "To use the bot:"
 echo "  1. Get a bot token from @BotFather on Telegram"
 echo "  2. Set the token as an environment variable:"
-echo "     export TELEGRAM_TOKEN="your_token_here""
+echo '     export TELEGRAM_TOKEN="your_token_here"'
 echo "  3. Run the bot with:"
 echo "     ./telegram-chat-bot.sh"
