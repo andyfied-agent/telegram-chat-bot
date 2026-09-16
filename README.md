@@ -74,6 +74,12 @@ pytest tests/
 Tests cover Settings defaults, custom values, validation error paths for every numeric setting,
 and core bot logic (health checks, completion, chunking, user filtering).
 
+3. Set up your Telegram bot token:
+   - Create a new bot with @BotFather on Telegram
+   - Copy the token and set it as an environment variable:
+    ```
+cp .env.example .env
+    ```
 
 ## Usage
 
