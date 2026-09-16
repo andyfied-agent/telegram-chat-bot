@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -21,11 +21,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Settings:
     token: str
-    base_url: str = os.getenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:11438/v1")
-    model: str = os.getenv("LLAMA_CPP_MODEL", "ministral-3-3b-64k-q4_k_m.gguf")
-    timeout: float = float(os.getenv("LLAMA_CPP_TIMEOUT", "120"))
-    max_messages: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
-    max_chars: int = int(os.getenv("MAX_MESSAGE_CHARS", "8000"))
+    base_url: str = field(default_factory=lambda: os.getenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:11438/v1"))
+    model: str = field(default_factory=lambda: os.getenv("LLAMA_CPP_MODEL", "ministral-3-3b-64k-q4_k_m.gguf"))
+    timeout: float = field(default_factory=lambda: float(os.getenv("LLAMA_CPP_TIMEOUT", "120")))
+    max_messages: int = field(default_factory=lambda: int(os.getenv("MAX_CONTEXT_MESSAGES", "20")))
+    max_chars: int = field(default_factory=lambda: int(os.getenv("MAX_MESSAGE_CHARS", "8000")))
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:

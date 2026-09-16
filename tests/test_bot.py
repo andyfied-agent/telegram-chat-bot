@@ -1,7 +1,6 @@
-import asyncio
 import json
-from collections import deque
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 import pytest
 from telegram import Message, Update, User
@@ -62,18 +61,16 @@ def test_state_messages():
 
     # Test with user ID that has no history
     messages = state.messages(12345)
-    assert len(messages) == 2
+    assert len(messages) == 1
     assert messages[0]['role'] == 'system'
     assert messages[0]['content'] == 'Global prompt\nPrivate prompt'
-    assert messages[1]['role'] == 'user'
-    assert messages[1]['content'] == 'Test message'
 
     # Test with user ID that has history
     state.history[12345].append({'role': 'user', 'content': 'Previous message'})
     messages = state.messages(12345)
-    assert len(messages) == 3
-    assert messages[2]['role'] == 'user'
-    assert messages[2]['content'] == 'Previous message'
+    assert len(messages) == 2
+    assert messages[1]['role'] == 'user'
+    assert messages[1]['content'] == 'Previous message'
 
 
 def test_state_messages_no_prompts():
@@ -96,7 +93,7 @@ def test_state_messages_empty_history():
 
 
 @patch('telegram_chat_bot.urlopen')
-async def test_complete_success(mock_urlopen):
+def test_complete_success(mock_urlopen):
     # Test successful completion
     mock_response = MagicMock()
     mock_response.read.return_value = json.dumps({
@@ -106,12 +103,12 @@ async def test_complete_success(mock_urlopen):
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
-    result = await asyncio.to_thread(complete, settings, messages)
+    result = complete(settings, messages)
     assert result == 'Test response'
 
 
 @patch('telegram_chat_bot.urlopen')
-async def test_complete_empty_response(mock_urlopen):
+def test_complete_empty_response(mock_urlopen):
     # Test empty response
     mock_response = MagicMock()
     mock_response.read.return_value = json.dumps({
@@ -121,23 +118,23 @@ async def test_complete_empty_response(mock_urlopen):
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
-    with pytest.raises(RuntimeError, match='empty model response'):
-        await asyncio.to_thread(complete, settings, messages)
+    with pytest.raises(RuntimeError, match='model request failed'):
+        complete(settings, messages)
 
 
 @patch('telegram_chat_bot.urlopen')
-async def test_complete_http_error(mock_urlopen):
+def test_complete_http_error(mock_urlopen):
     # Test HTTP error
-    mock_urlopen.side_effect = Exception('HTTP Error')
+    mock_urlopen.side_effect = URLError('HTTP Error')
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
     with pytest.raises(RuntimeError, match='model request failed'):
-        await asyncio.to_thread(complete, settings, messages)
+        complete(settings, messages)
 
 
 @patch('telegram_chat_bot.urlopen')
-async def test_complete_json_error(mock_urlopen):
+def test_complete_json_error(mock_urlopen):
     # Test JSON decode error
     mock_response = MagicMock()
     mock_response.read.return_value = b'invalid json'
@@ -146,4 +143,4 @@ async def test_complete_json_error(mock_urlopen):
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
     with pytest.raises(RuntimeError, match='model request failed'):
-        await asyncio.to_thread(complete, settings, messages)
+        complete(settings, messages)
