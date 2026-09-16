@@ -27,6 +27,21 @@ class BotTests(unittest.TestCase):
             request = open_url.call_args.args[0]
             self.assertTrue(request.full_url.endswith("/chat/completions"))
 
+    def test_complete_rejects_invalid_response(self):
+        with patch.object(bot, "urlopen") as open_url:
+            open_url.return_value.__enter__.return_value.read.return_value = b"{}"
+            with self.assertRaises(RuntimeError):
+                bot.complete(self.settings, [{"role": "user", "content": "hi"}])
+
+    def test_message_content_is_bounded(self):
+        self.state.history[1].append({"role": "user", "content": "x" * 100})
+        self.assertEqual(len(self.state.messages(1)[0]["content"]), 100)
+
+    def test_main_requires_token(self):
+        with patch.dict(bot.os.environ, {"TELEGRAM_TOKEN": ""}, clear=False):
+            with self.assertRaises(SystemExit):
+                bot.main()
+
 
 if __name__ == "__main__":
     unittest.main()
