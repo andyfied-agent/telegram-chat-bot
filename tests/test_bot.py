@@ -4,7 +4,7 @@ from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, private
+from telegram_chat_bot import State, Settings, complete, private, _chunk
 
 
 def test_private_filter():
@@ -222,3 +222,67 @@ def test_admin_vs_allowed():
     assert not state.admin(123)
     assert not state.allowed(456)
     assert state.admin(456)
+
+
+def test_chunk_empty():
+    assert _chunk('') == ['']
+
+
+def test_chunk_single():
+    text = 'a' * 100
+    assert _chunk(text) == [text]
+
+
+def test_chunk_exact_boundary():
+    text = 'a' * 4096
+    assert _chunk(text) == [text]
+
+
+def test_chunk_over_boundary():
+    text = 'a' * 4097
+    result = _chunk(text)
+    assert len(result) == 2
+    assert len(result[0]) == 4096
+    assert len(result[1]) == 1
+
+
+def test_chunk_multi_boundary():
+    text = 'a' * 8200
+    result = _chunk(text)
+    assert len(result) == 3
+    assert len(result[0]) == 4096
+    assert len(result[1]) == 4096
+    assert len(result[2]) == 8
+
+
+def test_chunk_custom_max():
+    result = _chunk('abcde', 3)
+    assert result == ['abc', 'de']
+
+
+def test_chunk_preserves_full_response():
+    """Regression: _chunk(response[:4096]) truncated before chunking.
+    The full response from complete() must be split into Telegram-safe chunks."""
+    full = 'a' * 8192  # 2 full chunks + 0 extra (8192 = 2*4096)
+    chunks = _chunk(full)
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 4096
+    assert len(chunks[1]) == 4096
+    assert ''.join(chunks) == full  # full response preserved
+
+
+def test_chunk_preserves_over_boundary_full():
+    """Full response > 4096 must not lose trailing chars."""
+    full = 'b' * 6000  # 2 chunks: 4096 + 1904
+    chunks = _chunk(full)
+    assert len(chunks) == 2
+    assert len(chunks[0]) == 4096
+    assert len(chunks[1]) == 1904
+    assert ''.join(chunks) == full
+
+
+def test_chunk_single_chunk_preserved():
+    """Single-chunk response must be unchanged."""
+    text = 'c' * 2000
+    chunks = _chunk(text)
+    assert chunks == [text]

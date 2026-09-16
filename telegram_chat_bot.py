@@ -152,6 +152,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
 
 
+def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
+    """Split *text* into chunks of at most *max_chunk* characters."""
+    if len(text) <= max_chunk:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        chunks.append(text[:max_chunk])
+        text = text[max_chunk:]
+    return chunks
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
@@ -177,7 +187,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
         return
     state.history[user_id].append({"role": "assistant", "content": response})
-    await update.message.reply_text(response[:4096])
+    chunks = _chunk(response)
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
 
 
 def main() -> None:

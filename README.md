@@ -12,6 +12,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 - System prompt support: global and per-user private prompts
 - Rate limiting between model requests
 - Health status and conversation history commands
+- Response chunking: long model outputs (> 4096 chars) are automatically split into Telegram-compatible chunks
 
 ## Requirements
 
@@ -48,7 +49,7 @@ Set the following environment variables (documented in .env.example):
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
 - MAX_CONTEXT_MESSAGES -- Max conversation history messages per user. Default: 20.
-- MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000.
+- MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000. Response chunks are capped at 4096 characters (Telegram API limit).
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 
 ## Usage
@@ -97,6 +98,10 @@ The bot registers the following handlers:
 - /shutdown -> shutdown -- Refused remotely
 - /help -> help_command -- List commands
 - text (non-command) -> handle_message -- Chat completion via llama.cpp
+
+## Chunking
+
+Long model responses (> 4096 characters) are automatically split into multiple Telegram messages by the internal ``_chunk`` helper, preserving the full output.
 
 ## Tests
 
