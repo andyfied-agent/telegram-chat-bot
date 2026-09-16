@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "telegram-chat-bot"
+version = "0.1.0"
+description = "Telegram chat bot running on Ministral"
+authors = ["andyfied-Thargoid <andyfied@users.noreply.github.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.7"
+python-telegram-bot = "^21.0.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "^6.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
