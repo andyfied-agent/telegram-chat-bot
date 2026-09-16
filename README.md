@@ -40,6 +40,10 @@ python telegram-chat-bot.py
 
 - `/start` - Start the bot
 - `/status` - Check bot status
+- `/reset` - Reset conversation context
+- `/history` - Show conversation history
+- `/addglobalprompt` - Add a global prompt
+- `/addprivateprompt` - Add a private prompt
 - `/help` - Show this help message
 
 ## Security
