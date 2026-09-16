@@ -141,7 +141,7 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /help")
+    await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
