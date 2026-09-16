@@ -7,7 +7,7 @@ Responds only to direct messages
 import os
 import sys
 import logging
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Configure logging
@@ -22,6 +22,9 @@ TOKEN = os.getenv('TELEGRAM_TOKEN')
 
 # Store bot status
 bot_running = True
+
+# In-memory storage for conversation context (in a real implementation, this would be more robust)
+conversation_context = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
@@ -39,13 +42,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Bot is currently shutdown.")
 
-async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shutdown the bot."""
-    # Shutdown from Telegram is disabled - only local shutdown is allowed
-    await update.message.reply_text("Shutdown from Telegram is disabled. Please shutdown the bot locally.")
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reset the bot's conversation context."""
+    user_id = update.effective_user.id
+    if user_id in conversation_context:
+        del conversation_context[user_id]
     await update.message.reply_text("Bot conversation context has been reset.")
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -60,18 +61,46 @@ async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Add a private prompt."""
     await update.message.reply_text("Private prompt added successfully.")
 
+async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shutdown the bot."""
+    # Shutdown from Telegram is disabled - only local shutdown is allowed
+    await update.message.reply_text("Shutdown from Telegram is disabled. Please shutdown the bot locally.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send help message."""
+    help_text = (
+        "Available commands:\n"
+        "/start - Start the bot\n"
+        "/status - Check bot status\n"
+        "/reset - Reset conversation context\n"
+        "/history - Show conversation history\n"
+        "/addglobalprompt - Add a global prompt\n"
+        "/addprivateprompt - Add a private prompt\n"
+        "/help - Show this help message\n\n"
+        "Note: I only respond to direct messages."
+    )
+    await update.message.reply_text(help_text)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages - only respond to direct messages."""
     # Check if message is in a group or channel
     if update.message.chat.type != "private":
         return
     
-    # Process the message with Ministral (placeholder for actual Ministral integration)
+    # Get user ID
+    user_id = update.effective_user.id
     user_message = update.message.text
-    response = f"I received your message: '{user_message}'"
     
     # Simulate Ministral processing
     # In a real implementation, you would integrate Ministral here
+    response = f"I received your message: '{user_message}'"
+    
+    # For demo purposes, we'll simulate some conversation context
+    if user_id not in conversation_context:
+        conversation_context[user_id] = []
+    
+    conversation_context[user_id].append(f"User: {user_message}")
+    
     await update.message.reply_text(response)
 
 def main() -> None:
@@ -90,32 +119,15 @@ def main() -> None:
     application.add_handler(CommandHandler("history", history))
     application.add_handler(CommandHandler("addglobalprompt", addglobalprompt))
     application.add_handler(CommandHandler("addprivateprompt", addprivateprompt))
+    application.add_handler(CommandHandler("shutdown", shutdown))
     application.add_handler(CommandHandler("help", help_command))
     
     # Register message handler for direct messages only
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Help command
-    application.add_handler(CommandHandler("help", help_command))
-
     # Run the bot until the user presses Ctrl-C
     logger.info("Starting bot...")
     application.run_polling()
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send help message."""
-    help_text = (
-        "Available commands:\n"
-        "/start - Start the bot\n"
-        "/status - Check bot status\n"
-        "/reset - Reset conversation context\n"
-        "/history - Show conversation history\n"
-        "/addglobalprompt - Add a global prompt\n"
-        "/addprivateprompt - Add a private prompt\n"
-        "/help - Show this help message\n\n"
-        "Note: I only respond to direct messages."
-    )
-    await update.message.reply_text(help_text)
 
 if __name__ == '__main__':
     main()
