@@ -1,6 +1,6 @@
 # Telegram Chat Bot
 
-A Telegram chat bot running on Ministral that responds only to direct messages. The bot is designed to be easy to install, invoke, check status, and shutdown.
+A Telegram chat bot backed by a local Ministral llama.cpp server that responds only to direct messages.
 
 ## Features
 
@@ -26,7 +26,8 @@ A Telegram chat bot running on Ministral that responds only to direct messages. 
    - Create a new bot with @BotFather on Telegram
    - Copy the token and set it as an environment variable:
      ```
-     export TELEGRAM_TOKEN="your_token_here"
+   export TELEGRAM_TOKEN="your_token_here"
+   export LLAMA_CPP_BASE_URL="http://127.0.0.1:11438/v1"
      ```
 
 ## Usage
@@ -62,23 +63,13 @@ The bot can be started with:
 python bot.py
 ```
 
-To check the status:
-```
-# In another terminal, while the bot is running
-curl http://localhost:8000/status
-```
-
-To shutdown the bot:
-```
-# In another terminal, while the bot is running
-curl http://localhost:8000/shutdown
-```
+The `/status` and `/shutdown` commands are available only through private Telegram messages; shutdown is intentionally refused remotely.
 
 ## Development
 
-For development, you can use Poetry to manage dependencies:
+For development, use the isolated environment created by `install.sh`:
 ```
-poetry install
+./.venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## License

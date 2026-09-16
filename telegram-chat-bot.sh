@@ -12,5 +12,5 @@ if [ -z "$TELEGRAM_TOKEN" ]; then
     exit 1
 fi
 
-# Run the bot
-python3 telegram-chat-bot.py
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/telegram-chat-bot.py"

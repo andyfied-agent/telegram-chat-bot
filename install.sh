@@ -16,9 +16,12 @@ if ! command -v pip3 &> /dev/null; then
     exit 1
 fi
 
-# Install required dependencies
-echo "Installing dependencies..."
-pip3 install python-telegram-bot
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+echo "Creating isolated virtual environment..."
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
 
 echo "Installation complete!"
 echo "To use the bot:"

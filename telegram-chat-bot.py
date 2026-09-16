@@ -1,133 +1,156 @@
 #!/usr/bin/env python3
-"""
-Telegram Chat Bot that runs on Ministral
-Responds only to direct messages
-"""
+"""Private-message Telegram bot backed by a local llama.cpp OpenAI API."""
 
+import asyncio
+import json
+import logging
 import os
 import sys
-import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Bot token from environment variable
-TOKEN = os.getenv('TELEGRAM_TOKEN')
 
-# Store bot status
-bot_running = True
+@dataclass(frozen=True)
+class Settings:
+    token: str
+    base_url: str = os.getenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:11438/v1")
+    model: str = os.getenv("LLAMA_CPP_MODEL", "ministral-3-3b-64k-q4_k_m.gguf")
+    timeout: float = float(os.getenv("LLAMA_CPP_TIMEOUT", "120"))
+    max_messages: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
+    max_chars: int = int(os.getenv("MAX_MESSAGE_CHARS", "8000"))
 
-# In-memory storage for conversation context (in a real implementation, this would be more robust)
-conversation_context = {}
+
+def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+    payload = json.dumps({"model": settings.model, "messages": messages, "temperature": 0.7}).encode()
+    request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
+                      headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=settings.timeout) as response:
+            data = json.loads(response.read())
+        text = data["choices"][0]["message"].get("content", "").strip()
+        if not text:
+            raise ValueError("empty model response")
+        return text
+    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError("model request failed") from exc
+
+
+class State:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.history: dict[int, deque[dict[str, str]]] = defaultdict(
+            lambda: deque(maxlen=settings.max_messages)
+        )
+        self.global_prompt = ""
+        self.private_prompts: dict[int, str] = {}
+
+    def messages(self, user_id: int) -> list[dict[str, str]]:
+        prompt = self.global_prompt
+        if self.private_prompts.get(user_id):
+            prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
+        result = ([{"role": "system", "content": prompt}] if prompt else [])
+        result.extend(self.history[user_id])
+        return result
+
+
+def private() -> filters.BaseFilter:
+    return filters.ChatType.PRIVATE
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    await update.message.reply_text(
-        f"Hello {user.first_name}! I'm your Telegram chat bot.\n"
-        "I only respond to direct messages. Send me a message and I'll reply!"
-    )
+    await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check bot status."""
-    global bot_running
-    if bot_running:
-        await update.message.reply_text("Bot is running and ready to respond.")
-    else:
-        await update.message.reply_text("Bot is currently shutdown.")
+    state: State = context.application.bot_data["state"]
+    await update.message.reply_text(f"Running {state.settings.model}; retaining up to {state.settings.max_messages} messages.")
+
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reset the bot's conversation context."""
-    user_id = update.effective_user.id
-    if user_id in conversation_context:
-        del conversation_context[user_id]
-    await update.message.reply_text("Bot conversation context has been reset.")
+    state: State = context.application.bot_data["state"]
+    state.history.pop(update.effective_user.id, None)
+    await update.message.reply_text("Your conversation context has been reset.")
+
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show conversation history."""
-    await update.message.reply_text("Conversation history is not stored for privacy reasons.")
+    state: State = context.application.bot_data["state"]
+    await update.message.reply_text(f"I retain {len(state.history[update.effective_user.id])} recent messages in memory for this chat.")
+
 
 async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a global prompt."""
-    await update.message.reply_text("Global prompt added successfully.")
+    state: State = context.application.bot_data["state"]
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Usage: /addglobalprompt <prompt>")
+        return
+    state.global_prompt = prompt[: state.settings.max_chars]
+    await update.message.reply_text("Global prompt updated.")
+
 
 async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a private prompt."""
-    await update.message.reply_text("Private prompt added successfully.")
+    state: State = context.application.bot_data["state"]
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Usage: /addprivateprompt <prompt>")
+        return
+    state.private_prompts[update.effective_user.id] = prompt[: state.settings.max_chars]
+    await update.message.reply_text("Private prompt updated.")
+
 
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shutdown the bot."""
-    # Shutdown from Telegram is disabled - only local shutdown is allowed
-    await update.message.reply_text("Shutdown from Telegram is disabled. Please shutdown the bot locally.")
+    await update.message.reply_text("Shutdown from Telegram is disabled; stop the local service instead.")
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send help message."""
-    help_text = (
-        "Available commands:\n"
-        "/start - Start the bot\n"
-        "/status - Check bot status\n"
-        "/reset - Reset conversation context\n"
-        "/history - Show conversation history\n"
-        "/addglobalprompt - Add a global prompt\n"
-        "/addprivateprompt - Add a private prompt\n"
-        "/help - Show this help message\n\n"
-        "Note: I only respond to direct messages."
-    )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /help")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages - only respond to direct messages."""
-    # Check if message is in a group or channel
-    if update.message.chat.type != "private":
+    if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
-    
-    # Get user ID
+    state: State = context.application.bot_data["state"]
+    text = (update.message.text or "").strip()[: state.settings.max_chars]
+    if not text:
+        return
     user_id = update.effective_user.id
-    user_message = update.message.text
-    
-    # Simulate Ministral processing
-    # In a real implementation, you would integrate Ministral here
-    response = f"I received your message: '{user_message}'"
-    
-    # For demo purposes, we'll simulate some conversation context
-    if user_id not in conversation_context:
-        conversation_context[user_id] = []
-    
-    conversation_context[user_id].append(f"User: {user_message}")
-    
-    await update.message.reply_text(response)
+    state.history[user_id].append({"role": "user", "content": text})
+    try:
+        response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
+    except RuntimeError:
+        state.history[user_id].pop()
+        logger.exception("llama.cpp request failed for user %s", user_id)
+        await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
+        return
+    state.history[user_id].append({"role": "assistant", "content": response})
+    await update.message.reply_text(response[:4096])
+
 
 def main() -> None:
-    """Start the bot."""
-    if not TOKEN:
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
         logger.error("TELEGRAM_TOKEN environment variable not set")
         sys.exit(1)
-    
-    # Create the Application and pass it your bot's token
-    application = Application.builder().token(TOKEN).build()
+    settings = Settings(token=token)
+    app = Application.builder().token(token).build()
+    app.bot_data["state"] = State(settings)
+    only_private = private()
+    commands = {"start": start, "status": status, "reset": reset, "history": history,
+                "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
+                "shutdown": shutdown, "help": help_command}
+    for name, callback in commands.items():
+        app.add_handler(CommandHandler(name, callback, filters=only_private))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("Starting bot with llama.cpp model %s", settings.model)
+    app.run_polling()
 
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("history", history))
-    application.add_handler(CommandHandler("addglobalprompt", addglobalprompt))
-    application.add_handler(CommandHandler("addprivateprompt", addprivateprompt))
-    application.add_handler(CommandHandler("shutdown", shutdown))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Register message handler for direct messages only
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Run the bot until the user presses Ctrl-C
-    logger.info("Starting bot...")
-    application.run_polling()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
