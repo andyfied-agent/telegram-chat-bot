@@ -16,6 +16,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 ## Requirements
 
 - Python 3.10+
+- curl (for pip bootstrap on systems without ensurepip)
 - A running llama.cpp OpenAI-compatible server serving a Ministral model
   - Default model: ministral-3-3b-64k-q4_k_m.gguf
   - Default URL: http://127.0.0.1:11438/v1
@@ -26,9 +27,15 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
    git clone https://github.com/andyfied-Thargoid/telegram-chat-bot.git
    cd telegram-chat-bot
 
-2. Install dependencies:
-   python3 -m venv .venv
-   .venv/bin/python -m pip install -r requirements.lock
+2. Run the install script (handles venv creation, pip bootstrap, and dependency installation):
+   ./install.sh
+
+   Or do it manually:
+   python3 -m venv --without-pip .venv
+   curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+   .venv/bin/python3 /tmp/get-pip.py
+   rm /tmp/get-pip.py
+   .venv/bin/python3 -m pip install -r requirements.lock
 
 ## Environment Variables
 
@@ -47,6 +54,7 @@ Set the following environment variables (documented in .env.example):
 
 ### Direct Start
 
+source .venv/bin/activate
 python3 telegram_chat_bot.py
 
 Or use the convenience script:
@@ -92,7 +100,7 @@ The bot registers the following handlers:
 
 Tests use pytest and mock the HTTP layer. Run from the project root:
 
-python3 -m pytest tests/test_bot.py -v
+.venv/bin/python -m pytest tests/test_bot.py -v
 
 Test coverage includes:
 - Private filter creation
@@ -121,7 +129,8 @@ The unit runs as a simple service with hardened settings (PrivateTmp, ProtectHom
 
 ## Development
 
-./.venv/bin/python -m pytest tests/test_bot.py -v
+source .venv/bin/activate
+python -m pytest tests/test_bot.py -v
 
 ## License
 
