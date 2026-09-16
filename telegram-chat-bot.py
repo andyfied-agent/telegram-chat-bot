@@ -41,14 +41,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shutdown the bot."""
-    global bot_running
-    if bot_running:
-        bot_running = False
-        await update.message.reply_text("Bot is shutting down...")
-        # Exit the application
-        await context.application.stop()
-    else:
-        await update.message.reply_text("Bot is already shutdown.")
+    # Shutdown from Telegram is disabled - only local shutdown is allowed
+    await update.message.reply_text("Shutdown from Telegram is disabled. Please shutdown the bot locally.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send help message."""

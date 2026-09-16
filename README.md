@@ -40,12 +40,11 @@ python telegram-chat-bot.py
 
 - `/start` - Start the bot
 - `/status` - Check bot status
-- `/shutdown` - Shutdown the bot (only available when running)
 - `/help` - Show this help message
 
 ## Security
 
-The bot only responds to direct messages to ensure privacy and prevent spam in group chats.
+The bot only responds to direct messages to ensure privacy and prevent spam in group chats. Shutdown commands can only be issued locally, not through Telegram.
 
 ## Requirements
 
