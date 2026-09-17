@@ -56,6 +56,28 @@ def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
         raise RuntimeError("model request failed") from exc
 
 
+def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
+    """Return (model_name, is_online) from a bounded llama.cpp /health request.
+
+    Safely derives the health URL from *base_url*, strips any trailing
+    ``/v1`` path segment so the final URL is ``{base}/health``, and reads
+    the response on a short timeout so it never blocks the async event
+    loop.  Model name is read from the response JSON; secrets (tokens,
+    private keys, etc.) are never exposed.
+    """
+    url = base_url.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    url += "/health"
+    request = Request(url, method="GET", headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        model_name = data.get("model", "unknown")
+        return model_name, True
+    except Exception:
+        return "unreachable", False
+
 class State:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -96,7 +118,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     if not state.allowed(update.effective_user.id):
         return
-    await update.message.reply_text(f"Running {state.settings.model}; retaining up to {state.settings.max_messages} messages.")
+    model_name, is_online = await asyncio.to_thread(
+        health_check, state.settings.base_url, 5
+    )
+    if is_online:
+        await update.message.reply_text(
+            f"Model {model_name} is online; retaining up to {state.settings.max_messages} messages."
+        )
+    else:
+        await update.message.reply_text(
+            "Model unreachable; cannot confirm health."
+        )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

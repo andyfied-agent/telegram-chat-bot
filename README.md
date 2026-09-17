@@ -120,6 +120,8 @@ Test coverage includes:
 - handle_message ignoring a non-private chat
 - handle_message rate limiting (wait reply; no history written)
 - handle_message model failure rollback (history removed; error reply sent)
+- health_check healthy and unhealthy /health endpoint scenarios
+- health_check URL derivation strips /v1 suffix and trailing slashes
 
 ## systemd Deployment
 

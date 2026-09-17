@@ -396,3 +396,107 @@ async def test_handle_message_model_failure_rollback():
         "I couldn\'t reach the local model. Please try again shortly."
     )
     assert len(state.history[123]) == 0
+
+
+# --- health_check tests ---
+
+
+def test_health_check_healthy():
+    """Healthy /health returns (model_name, True)."""
+    from telegram_chat_bot import health_check
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({"model": "ministral-3-3b-64k-q4_k_m.gguf"}).encode()
+    with patch("telegram_chat_bot.urlopen", return_value=MagicMock(
+            __enter__=MagicMock(return_value=mock_response),
+            __exit__=MagicMock(return_value=False))):
+        model_name, is_online = health_check("http://127.0.0.1:11438/v1", timeout=5)
+    assert is_online is True
+    assert model_name == "ministral-3-3b-64k-q4_k_m.gguf"
+
+
+def test_health_check_unreachable():
+    """Unreachable /health returns ("unreachable", False)."""
+    from telegram_chat_bot import health_check
+    with patch("telegram_chat_bot.urlopen", side_effect=URLError("connection refused")):
+        model_name, is_online = health_check("http://127.0.0.1:9999/v1", timeout=5)
+    assert is_online is False
+    assert model_name == "unreachable"
+
+
+def test_health_check_strips_v1_suffix():
+    """Health URL must be {base}/health, not {base}/v1/health."""
+    from telegram_chat_bot import health_check
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({"model": "test-model"}).encode()
+    mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_response),
+                         __exit__=MagicMock(return_value=False))
+    with patch("telegram_chat_bot.urlopen", return_value=mock_ctx) as mock_urlopen:
+        health_check("http://127.0.0.1:11438/v1", timeout=5)
+    expected_url = "http://127.0.0.1:11438/health"
+    call_url = mock_urlopen.call_args[0][0].full_url
+    assert call_url == expected_url
+
+
+def test_health_check_trailing_slash():
+    """Trailing slash in base_url must not produce /health/health."""
+    from telegram_chat_bot import health_check
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({"model": "test"}).encode()
+    mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_response),
+                         __exit__=MagicMock(return_value=False))
+    with patch("telegram_chat_bot.urlopen", return_value=mock_ctx) as mock_urlopen:
+        health_check("http://127.0.0.1:11438/v1/", timeout=5)
+    call_url = mock_urlopen.call_args[0][0].full_url
+    assert call_url == "http://127.0.0.1:11438/health"
+
+
+def test_health_check_no_secrets():
+    """health_check must not expose secrets (only model name and boolean)."""
+    from telegram_chat_bot import health_check
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({
+        "model": "secret-model",
+        "secret_key": "abc123"
+    }).encode()
+    mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_response),
+                         __exit__=MagicMock(return_value=False))
+    with patch("telegram_chat_bot.urlopen", return_value=mock_ctx):
+        model_name, is_online = health_check("http://127.0.0.1:11438/v1", timeout=5)
+    assert is_online is True
+    assert model_name == "secret-model"
+    # No secret_key should leak
+    assert "secret_key" not in repr((model_name, is_online))
+
+
+def test_health_check_path_without_v1_suffix():
+    """Regression: base URL with a path that does NOT end in /v1 must not be mutated.
+
+    E.g. a base_url like "http://127.0.0.1:11438/api" should produce
+    "http://127.0.0.1:11438/api/health", not "http://127.0.0.1/health".
+    """
+    from telegram_chat_bot import health_check
+
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({"model": "test-model"}).encode()
+    mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_response),
+                         __exit__=MagicMock(return_value=False))
+    with patch("telegram_chat_bot.urlopen", return_value=mock_ctx) as mock_urlopen:
+        health_check("http://127.0.0.1:11438/api", timeout=5)
+
+    call_url = mock_urlopen.call_args[0][0].full_url
+    assert call_url == "http://127.0.0.1:11438/api/health"
+
+
+def test_health_check_v1alpha_suffix():
+    """A /v1alpha suffix must NOT be stripped — it should keep /api/v1alpha/health."""
+    from telegram_chat_bot import health_check
+
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({"model": "test-model"}).encode()
+    mock_ctx = MagicMock(__enter__=MagicMock(return_value=mock_response),
+                         __exit__=MagicMock(return_value=False))
+    with patch("telegram_chat_bot.urlopen", return_value=mock_ctx) as mock_urlopen:
+        health_check("http://host/api/v1alpha", timeout=5)
+
+    call_url = mock_urlopen.call_args[0][0].full_url
+    assert call_url == "http://host/api/v1alpha/health"
