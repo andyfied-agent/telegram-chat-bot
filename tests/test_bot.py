@@ -500,3 +500,232 @@ def test_health_check_v1alpha_suffix():
 
     call_url = mock_urlopen.call_args[0][0].full_url
     assert call_url == "http://host/api/v1alpha/health"
+
+
+# ---- Numeric setting validation tests ----
+
+
+def test_validate_numeric_setting_imports():
+    """Confirm _validate_numeric_setting is importable."""
+    from telegram_chat_bot import _validate_numeric_setting
+    assert callable(_validate_numeric_setting)
+
+
+def test_validate_numeric_setting_positive_int():
+    from telegram_chat_bot import _validate_numeric_setting
+    assert _validate_numeric_setting("42", "TEST") == 42
+    assert _validate_numeric_setting("1", "TEST") == 1
+
+
+def test_validate_numeric_setting_positive_float():
+    from telegram_chat_bot import _validate_numeric_setting
+    assert _validate_numeric_setting("1.5", "TEST", as_float=True) == 1.5
+    assert _validate_numeric_setting("0.1", "TEST", as_float=True) == 0.1
+
+
+def test_validate_numeric_setting_non_numeric_raises():
+    from telegram_chat_bot import _validate_numeric_setting
+    for bad in ("abc", "", "1.2.3", "  "):
+        with pytest.raises(ValueError) as exc:
+            _validate_numeric_setting(bad, "TEST")
+        assert "must be a numeric value" in str(exc.value)
+
+
+def test_validate_numeric_setting_zero_raises():
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("0", "TEST")
+    assert "must be positive" in str(exc.value)
+
+
+def test_validate_numeric_setting_negative_raises():
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("-5", "TEST")
+    assert "must be positive" in str(exc.value)
+
+
+def test_validate_numeric_setting_negative_float_raises():
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("-0.5", "TEST", as_float=True)
+    assert "must be positive" in str(exc.value)
+
+
+def test_validate_numeric_setting_none_raises():
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting(None, "TEST")
+    assert "must be a numeric value" in str(exc.value)
+
+
+# ---- Invalid environment values via Settings ----
+
+
+def test_settings_invalid_timeout_raises():
+    with patch.dict('os.environ', {
+        'LLAMA_CPP_TIMEOUT': 'abc',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "LLAMA_CPP_TIMEOUT" in str(exc.value)
+
+
+def test_settings_invalid_max_context_raises():
+    with patch.dict('os.environ', {
+        'MAX_CONTEXT_MESSAGES': '-1',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "MAX_CONTEXT_MESSAGES" in str(exc.value)
+
+
+def test_settings_invalid_max_chars_raises():
+    with patch.dict('os.environ', {
+        'MAX_MESSAGE_CHARS': '0',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "MAX_MESSAGE_CHARS" in str(exc.value)
+
+
+def test_settings_invalid_request_interval_raises():
+    with patch.dict('os.environ', {
+        'MODEL_REQUEST_INTERVAL': 'xyz',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
+
+
+def test_settings_zero_timeout_raises():
+    with patch.dict('os.environ', {
+        'LLAMA_CPP_TIMEOUT': '0',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "must be positive" in str(exc.value)
+
+
+def test_settings_default_validations():
+    """Defaults (unset vars) must parse to valid numeric values."""
+    settings = Settings(token='test_token')
+    assert settings.timeout == 120.0
+    assert settings.max_messages == 20
+    assert settings.max_chars == 8000
+    assert settings.request_interval == 1.0
+
+
+def test_settings_valid_float_interval():
+    with patch.dict('os.environ', {
+        'MODEL_REQUEST_INTERVAL': '2.5',
+    }):
+        settings = Settings(token='test_token')
+    assert settings.request_interval == 2.5
+
+
+def test_settings_valid_int_values():
+    with patch.dict('os.environ', {
+        'LLAMA_CPP_TIMEOUT': '60',
+        'MAX_CONTEXT_MESSAGES': '50',
+        'MAX_MESSAGE_CHARS': '16000',
+    }):
+        settings = Settings(token='test_token')
+    assert settings.timeout == 60.0
+    assert settings.max_messages == 50
+    assert settings.max_chars == 16000
+
+
+# ---- NaN / Inf regression tests ----
+
+
+def test_validate_numeric_setting_nan_raises():
+    """nan must be rejected with a descriptive ValueError."""
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("nan", "TEST", as_float=True)
+    assert "finite positive value" in str(exc.value)
+
+
+def test_validate_numeric_setting_inf_raises():
+    """inf must be rejected with a descriptive ValueError."""
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("inf", "TEST", as_float=True)
+    assert "finite positive value" in str(exc.value)
+
+
+def test_validate_numeric_setting_negative_inf_raises():
+    """-inf must be rejected with a descriptive ValueError.
+    
+    -inf is <= 0 so gets caught by the positive check first.
+    """
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("-inf", "TEST", as_float=True)
+    # -inf is <= 0, so the "must be positive" path fires
+    assert "must be positive" in str(exc.value)
+
+
+def test_validate_numeric_setting_infinity_raises():
+    """'Infinity' (Python float alias for inf) must be rejected."""
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("Infinity", "TEST", as_float=True)
+    assert "finite positive value" in str(exc.value)
+
+
+def test_validate_numeric_setting_negative_infinity_raises():
+    """'-Infinity' must be rejected.
+    
+    Like -inf, -Infinity <= 0 so the positive check catches it.
+    """
+    from telegram_chat_bot import _validate_numeric_setting
+    with pytest.raises(ValueError) as exc:
+        _validate_numeric_setting("-Infinity", "TEST", as_float=True)
+    # -Infinity is <= 0, so the "must be positive" path fires
+    assert "must be positive" in str(exc.value)
+
+
+def test_settings_invalid_nan_timeout_raises():
+    """LLAMA_CPP_TIMEOUT=nan must raise ValueError at Settings init.
+    
+    LLAMA_CPP_TIMEOUT is validated as int, so "nan" is caught by the
+    non-numeric path (int("nan") raises ValueError).
+    """
+    with patch.dict("os.environ", {"LLAMA_CPP_TIMEOUT": "nan"}):
+        with pytest.raises(ValueError) as exc:
+            Settings(token="test_token")
+        assert "LLAMA_CPP_TIMEOUT" in str(exc.value)
+        assert "must be a numeric value" in str(exc.value)
+
+
+def test_settings_invalid_inf_interval_raises():
+    """MODEL_REQUEST_INTERVAL=inf must raise ValueError at Settings init."""
+    with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "inf"}):
+        with pytest.raises(ValueError) as exc:
+            Settings(token="test_token")
+        assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
+        assert "finite positive value" in str(exc.value)
+
+
+
+def test_settings_invalid_nan_interval_raises():
+    """MODEL_REQUEST_INTERVAL=nan must raise ValueError (as_float=True path)."""
+    with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "nan"}):
+        with pytest.raises(ValueError) as exc:
+            Settings(token="test_token")
+        assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
+        assert "finite positive value" in str(exc.value)
+
+
+def test_settings_invalid_negative_inf_interval_raises():
+    """MODEL_REQUEST_INTERVAL=-inf must raise ValueError (as_float=True path).
+    
+    -inf is <= 0, so the "must be positive" check catches it.
+    """
+    with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "-inf"}):
+        with pytest.raises(ValueError) as exc:
+            Settings(token="test_token")
+        assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
+        assert "must be positive" in str(exc.value)

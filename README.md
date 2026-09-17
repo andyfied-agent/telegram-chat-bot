@@ -52,6 +52,29 @@ Set the following environment variables (documented in .env.example):
 - MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000. Response chunks are capped at 4096 characters (Telegram API limit).
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 
+## Numeric Setting Validation
+
+All numeric environment variables are validated at import time:
+
+- **LLAMA_CPP_TIMEOUT** -- must be a positive number (default: 120).
+- **MAX_CONTEXT_MESSAGES** -- must be a positive integer (default: 20).
+- **MAX_MESSAGE_CHARS** -- must be a positive integer (default: 8000).
+- **MODEL_REQUEST_INTERVAL** -- must be a positive number (default: 1.0).
+
+Invalid values (non-numeric, zero, or negative) raise `ValueError` before the bot starts.
+
+## Testing
+
+Run the full suite with:
+
+```
+pytest tests/
+```
+
+Tests cover Settings defaults, custom values, validation error paths for every numeric setting,
+and core bot logic (health checks, completion, chunking, user filtering).
+
+
 ## Usage
 
 ### Direct Start

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import math
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -19,21 +20,43 @@ logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", lev
 logger = logging.getLogger(__name__)
 
 
+
+
+def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool = False) -> float:
+    """Validate that *value* is a numeric string representing a positive number.
+
+    Returns the parsed float.  Raises :exc:`ValueError` with the setting name
+    in the message when the value is non-numeric, not positive, or special (nan/inf).
+    """
+    try:
+        if as_float:
+            num = float(value)
+        else:
+            num = int(value)
+    except (ValueError, TypeError):
+        raise ValueError(f"{setting_name} must be a numeric value, got {value!r}")
+    if num <= 0:
+        raise ValueError(f"{setting_name} must be positive, got {num}")
+    if math.isnan(num) or math.isinf(num):
+        raise ValueError(f"{setting_name} must be a finite positive value, got {value!r}")
+    return num
+
+
 @dataclass(frozen=True)
 class Settings:
     token: str
     base_url: str = field(default_factory=lambda: os.getenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:11438/v1"))
     model: str = field(default_factory=lambda: os.getenv("LLAMA_CPP_MODEL", "ministral-3-3b-64k-q4_k_m.gguf"))
-    timeout: float = field(default_factory=lambda: float(os.getenv("LLAMA_CPP_TIMEOUT", "120")))
-    max_messages: int = field(default_factory=lambda: int(os.getenv("MAX_CONTEXT_MESSAGES", "20")))
-    max_chars: int = field(default_factory=lambda: int(os.getenv("MAX_MESSAGE_CHARS", "8000")))
+    timeout: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("LLAMA_CPP_TIMEOUT", "120"), "LLAMA_CPP_TIMEOUT"))
+    max_messages: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_CONTEXT_MESSAGES", "20"), "MAX_CONTEXT_MESSAGES"))
+    max_chars: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_MESSAGE_CHARS", "8000"), "MAX_MESSAGE_CHARS"))
     allowed_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if value.strip()
     ))
     admin_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ADMIN_USER_IDS", "").split(",") if value.strip()
     ))
-    request_interval: float = field(default_factory=lambda: float(os.getenv("MODEL_REQUEST_INTERVAL", "1.0")))
+    request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
