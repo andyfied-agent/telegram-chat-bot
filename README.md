@@ -115,8 +115,11 @@ Test coverage includes:
 - State initialization and allowlisting
 - Message assembly with global + private prompts
 - Successful, empty, HTTP error, and JSON decode error paths in complete()
+- Response chunking boundary conditions and full-response preservation
 - handle_message rejecting an unallowlisted user
 - handle_message ignoring a non-private chat
+- handle_message rate limiting (wait reply; no history written)
+- handle_message model failure rollback (history removed; error reply sent)
 
 ## systemd Deployment
 

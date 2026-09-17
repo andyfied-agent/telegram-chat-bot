@@ -333,3 +333,66 @@ async def test_handle_message_ignores_non_private_chat():
 
     # No reply should have been sent
     mock_update.message.reply_text.assert_not_called()
+
+
+import asyncio
+import time
+
+from unittest.mock import AsyncMock
+
+from telegram_chat_bot import handle_message
+
+
+@pytest.mark.asyncio
+async def test_handle_message_rate_limiting():
+    """A second request within the interval gets the wait reply and does NOT call
+    the model or add history."""
+    from telegram_chat_bot import Settings, State
+
+    settings = Settings(token='test', allowed_user_ids=frozenset({123}), request_interval=5.0)
+    state = State(settings)
+    state.last_request[123] = time.monotonic()
+
+    mock_update = MagicMock()
+    mock_update.effective_chat.type = "private"
+    mock_update.effective_user.id = 123
+    mock_update.message.text = "hello"
+    mock_update.message.reply_text = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+
+    await handle_message(mock_update, mock_context)
+
+    mock_update.message.reply_text.assert_called_once_with(
+        "Please wait a moment before sending another message."
+    )
+    assert len(state.history[123]) == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_message_model_failure_rollback():
+    """When the model raises, the user message is removed from history and an
+    error reply is sent."""
+    from telegram_chat_bot import Settings, State
+
+    settings = Settings(token='test', allowed_user_ids=frozenset({123}))
+    state = State(settings)
+    state.last_request[123] = 0
+
+    mock_update = MagicMock()
+    mock_update.effective_chat.type = "private"
+    mock_update.effective_user.id = 123
+    mock_update.message.text = "hello"
+    mock_update.message.reply_text = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+
+    with patch("telegram_chat_bot.complete", side_effect=RuntimeError("model request failed")):
+        await handle_message(mock_update, mock_context)
+
+    mock_update.message.reply_text.assert_called_once_with(
+        "I couldn\'t reach the local model. Please try again shortly."
+    )
+    assert len(state.history[123]) == 0
