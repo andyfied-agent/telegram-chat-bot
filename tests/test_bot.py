@@ -872,3 +872,24 @@ async def test_admin_can_list_and_revoke_users(tmp_path):
     await revoke(update, context)
     assert state.registrations.status(456) == "rejected"
     update.message.reply_text.assert_awaited_with("User 456 revoked.")
+
+
+@pytest.mark.asyncio
+async def test_start_parameter_is_rejected_without_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = ["invite-code"]
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+
+    assert state.registrations.status(123) is None
+    update.message.reply_text.assert_awaited_once_with(
+        "This bot does not support /start parameters. Send /start without additional text to request access."
+    )

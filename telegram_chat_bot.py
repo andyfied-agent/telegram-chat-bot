@@ -179,6 +179,12 @@ def private() -> filters.BaseFilter:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     user_id = update.effective_user.id
+    args = context.args if isinstance(context.args, (list, tuple)) else []
+    if args:
+        await update.message.reply_text(
+            "This bot does not support /start parameters. Send /start without additional text to request access."
+        )
+        return
     if state.allowed(user_id):
         await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
         return

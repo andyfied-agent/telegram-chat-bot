@@ -96,7 +96,7 @@ Or use the convenience script:
 
 ### Commands (private chat only)
 
-- /start -- Approved users receive a greeting; other users create or check an access request.
+- /start -- Approved users receive a greeting; other users create or check an access request. Optional /start parameters are rejected and never affect registration.
 - /approve <telegram_user_id> -- Administrator-only approval of a pending user.
 - /reject <telegram_user_id> -- Administrator-only rejection of a user.
 - /revoke <telegram_user_id> -- Administrator-only revocation of approved access.
