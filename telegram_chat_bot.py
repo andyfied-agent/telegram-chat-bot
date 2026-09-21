@@ -296,7 +296,7 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /users /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
