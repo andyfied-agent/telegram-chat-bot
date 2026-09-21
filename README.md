@@ -99,6 +99,7 @@ Or use the convenience script:
 - /start -- Approved users receive a greeting; other users create or check an access request.
 - /approve <telegram_user_id> -- Administrator-only approval of a pending user.
 - /reject <telegram_user_id> -- Administrator-only rejection of a user.
+- /revoke <telegram_user_id> -- Administrator-only revocation of approved access.
 - /users -- Administrator-only list of pending and approved registrations.
 - /status -- Shows current model name and history window size.
 - /reset -- Clears your conversation context.
@@ -127,6 +128,7 @@ The bot registers the following handlers:
 - /start -> start -- Greeting or registration request
 - /approve -> approve -- Approve a registration
 - /reject -> reject -- Reject a registration
+- /revoke -> revoke -- Revoke approved access
 - /users -> users -- List registration state
 - /status -> status -- Model + history window
 - /reset -> reset -- Clear conversation history

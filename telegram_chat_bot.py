@@ -219,6 +219,19 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"User {user_id} rejected.")
 
 
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can revoke users.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /revoke <telegram_user_id>")
+        return
+    user_id = int(context.args[0])
+    state.registrations.set_status(user_id, "rejected")
+    await update.message.reply_text(f"User {user_id} revoked.")
+
+
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     if not state.admin(update.effective_user.id):
@@ -296,7 +309,7 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /users /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
@@ -348,7 +361,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
     only_private = private()
-    commands = {"start": start, "approve": approve, "reject": reject, "users": users,
+    commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
                 "shutdown": shutdown, "help": help_command}

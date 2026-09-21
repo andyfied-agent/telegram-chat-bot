@@ -849,3 +849,26 @@ async def test_rejected_registration_cannot_start_or_chat(tmp_path):
     update.message.reply_text.assert_awaited_once_with(
         "Your access request was rejected by an administrator."
     )
+
+
+@pytest.mark.asyncio
+async def test_admin_can_list_and_revoke_users(tmp_path):
+    from telegram_chat_bot import Settings, State, revoke, users
+
+    settings = Settings(token="test", admin_user_ids=frozenset({999}), registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "pending")
+    state.registrations.set_status(456, "approved")
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = []
+    context.application.bot_data = {"state": state}
+
+    await users(update, context)
+    update.message.reply_text.assert_awaited_once_with("Pending: 123\nApproved: 456")
+    context.args = ["456"]
+    await revoke(update, context)
+    assert state.registrations.status(456) == "rejected"
+    update.message.reply_text.assert_awaited_with("User 456 revoked.")
