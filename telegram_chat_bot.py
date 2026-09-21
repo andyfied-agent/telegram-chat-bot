@@ -10,6 +10,8 @@ import math
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -18,6 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 
@@ -57,6 +60,47 @@ class Settings:
         int(value.strip()) for value in os.getenv("TELEGRAM_ADMIN_USER_IDS", "").split(",") if value.strip()
     ))
     request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
+    registration_file: str = field(default_factory=lambda: os.path.expanduser(
+        os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
+    ))
+
+
+class RegistrationStore:
+    """Persist pending and approved Telegram user registrations atomically."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            self._users = json.loads(self.path.read_text())
+            if not isinstance(self._users, dict):
+                raise ValueError("registration store must contain an object")
+        else:
+            self._users: dict[str, str] = {}
+
+    def status(self, user_id: int) -> str | None:
+        return self._users.get(str(user_id))
+
+    def set_status(self, user_id: int, status: str) -> None:
+        if status not in {"pending", "approved", "rejected"}:
+            raise ValueError(f"invalid registration status: {status}")
+        self._users[str(user_id)] = status
+        self._save()
+
+    def users(self, status: str | None = None) -> list[int]:
+        return sorted(int(user_id) for user_id, value in self._users.items() if status is None or value == status)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
+        try:
+            with open(fd, "w") as handle:
+                json.dump(self._users, handle, sort_keys=True)
+                handle.write("\n")
+            Path(temporary).chmod(0o600)
+            Path(temporary).replace(self.path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
@@ -111,9 +155,10 @@ class State:
         self.private_prompts: dict[int, str] = {}
         self.last_request: dict[int, float] = {}
         self.request_gate = asyncio.Semaphore(1)
+        self.registrations = RegistrationStore(settings.registration_file)
 
     def allowed(self, user_id: int) -> bool:
-        return user_id in self.settings.allowed_user_ids
+        return user_id in self.settings.allowed_user_ids or self.registrations.status(user_id) == "approved"
 
     def admin(self, user_id: int) -> bool:
         return user_id in self.settings.admin_user_ids
@@ -132,9 +177,56 @@ def private() -> filters.BaseFilter:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.application.bot_data["state"].allowed(update.effective_user.id):
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if state.allowed(user_id):
+        await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
         return
-    await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
+    registration_status = state.registrations.status(user_id)
+    if registration_status == "pending":
+        await update.message.reply_text("Your access request is still pending administrator approval.")
+        return
+    if registration_status == "rejected":
+        await update.message.reply_text("Your access request was rejected by an administrator.")
+        return
+    state.registrations.set_status(user_id, "pending")
+    await update.message.reply_text("Your access request was recorded and is pending administrator approval.")
+
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can approve users.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /approve <telegram_user_id>")
+        return
+    user_id = int(context.args[0])
+    state.registrations.set_status(user_id, "approved")
+    await update.message.reply_text(f"User {user_id} approved.")
+
+
+async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can reject users.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /reject <telegram_user_id>")
+        return
+    user_id = int(context.args[0])
+    state.registrations.set_status(user_id, "rejected")
+    await update.message.reply_text(f"User {user_id} rejected.")
+
+
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can list users.")
+        return
+    pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
+    await update.message.reply_text(f"Pending: {pending}\nApproved: {approved}")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -256,13 +348,19 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
     only_private = private()
-    commands = {"start": start, "status": status, "reset": reset, "history": history,
+    commands = {"start": start, "approve": approve, "reject": reject, "users": users,
+                "status": status, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
                 "shutdown": shutdown, "help": help_command}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Starting bot with llama.cpp model %s", settings.model)
+    # Python 3.14 no longer creates the main-thread event loop implicitly.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling()
 
 

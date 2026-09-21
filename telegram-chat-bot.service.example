@@ -5,16 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/src/telegram-chat-bot
+WorkingDirectory=%h/opt/telegram-chat-bot
 EnvironmentFile=%h/.config/telegram-chat-bot/env
-ExecStart=%h/src/telegram-chat-bot/.venv/bin/python %h/src/telegram-chat-bot/telegram_chat_bot.py
+ExecStart=%h/opt/telegram-chat-bot/.venv/bin/python %h/opt/telegram-chat-bot/telegram_chat_bot.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/src/telegram-chat-bot
+ReadWritePaths=%h/opt/telegram-chat-bot %h/.local/state/telegram-chat-bot
 
 [Install]
 WantedBy=default.target

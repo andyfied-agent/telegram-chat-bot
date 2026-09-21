@@ -6,6 +6,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 
 - Responds only to private (direct) messages -- group chat messages are ignored
 - Allowlist-based user filtering via TELEGRAM_ALLOWED_USER_IDS
+- Approval-based registration requests via /start, persisted across restarts
 - Conversational chat backed by a local llama.cpp / OpenAI-compatible API
 - Context retention with configurable message history window
 - Bounded model responses (max_tokens, character truncation)
@@ -44,7 +45,8 @@ Set the following environment variables (documented in .env.example):
 
 - TELEGRAM_TOKEN -- Bot token from @BotFather on Telegram (required).
 - TELEGRAM_ALLOWED_USER_IDS -- Comma-separated Telegram numeric user IDs. If unset or empty, all Telegram users are rejected.
-- TELEGRAM_ADMIN_USER_IDS -- Comma-separated Telegram numeric user IDs with authority to change the global prompt. If unset or empty, the /addglobalprompt command is denied to all users.
+- TELEGRAM_ADMIN_USER_IDS -- Comma-separated Telegram numeric user IDs with authority to change the global prompt and manage registrations. If unset or empty, admin commands are denied to all users.
+- TELEGRAM_REGISTRATION_FILE -- JSON registration store. Default: ~/.local/state/telegram-chat-bot/registrations.json.
 - LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:11438/v1.
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
@@ -94,7 +96,10 @@ Or use the convenience script:
 
 ### Commands (private chat only)
 
-- /start -- Greeting; confirms bot is running and listening.
+- /start -- Approved users receive a greeting; other users create or check an access request.
+- /approve <telegram_user_id> -- Administrator-only approval of a pending user.
+- /reject <telegram_user_id> -- Administrator-only rejection of a user.
+- /users -- Administrator-only list of pending and approved registrations.
 - /status -- Shows current model name and history window size.
 - /reset -- Clears your conversation context.
 - /history -- Reports how many messages are retained in memory.
@@ -109,16 +114,20 @@ Shutdown via Telegram is intentionally disabled. Stop the bot by terminating the
 
 ## Security
 
-- Allowlisting: TELEGRAM_ALLOWED_USER_IDS must be set to a comma-separated list of Telegram user IDs. Every command and message is checked against this list; unlisted users receive no response.
+- Allowlisting: TELEGRAM_ALLOWED_USER_IDS remains a static allowlist. Users approved through the persistent registration workflow are also allowed; unregistered users cannot chat or change prompts.
 - Private-only: All handlers use filters.ChatType.PRIVATE; group messages are silently ignored.
 - Remote shutdown disabled: The /shutdown command returns a polite refusal and suggests stopping the systemd service.
-- Admin authorization: TELEGRAM_ADMIN_USER_IDS authorizes users who may use /addglobalprompt. /addprivateprompt and chat still require TELEGRAM_ALLOWED_USER_IDS. If TELEGRAM_ADMIN_USER_IDS is unset or empty, no user can change the global prompt.
+- Admin authorization: TELEGRAM_ADMIN_USER_IDS authorizes prompt and registration-management commands. If it is unset or empty, no user can change the global prompt or registrations.
+- Registration: /start records a pending request only; an administrator must approve it. Registration data contains Telegram numeric IDs and should be protected and backed up as private state.
 
 ## Real Commands in Code
 
 The bot registers the following handlers:
 
-- /start -> start -- Welcome message
+- /start -> start -- Greeting or registration request
+- /approve -> approve -- Approve a registration
+- /reject -> reject -- Reject a registration
+- /users -> users -- List registration state
 - /status -> status -- Model + history window
 - /reset -> reset -- Clear conversation history
 - /history -> history -- Report memory size

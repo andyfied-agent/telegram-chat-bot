@@ -729,3 +729,65 @@ def test_settings_invalid_negative_inf_interval_raises():
             Settings(token="test_token")
         assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
         assert "must be positive" in str(exc.value)
+
+
+def test_registration_store_persists_status(tmp_path):
+    from telegram_chat_bot import RegistrationStore
+
+    path = tmp_path / "registrations.json"
+    store = RegistrationStore(str(path))
+    store.set_status(123, "pending")
+    assert store.status(123) == "pending"
+
+    restored = RegistrationStore(str(path))
+    assert restored.status(123) == "pending"
+    assert restored.users("pending") == [123]
+
+
+@pytest.mark.asyncio
+async def test_start_creates_pending_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+
+    assert state.registrations.status(123) == "pending"
+    update.message.reply_text.assert_awaited_once_with(
+        "Your access request was recorded and is pending administrator approval."
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_registration_is_allowed(tmp_path):
+    from telegram_chat_bot import Settings, State
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "approved")
+    assert state.allowed(123)
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_approve_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, approve
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = ["123"]
+    context.application.bot_data = {"state": state}
+
+    await approve(update, context)
+
+    assert state.registrations.status(123) is None
+    update.message.reply_text.assert_awaited_once_with("Only administrators can approve users.")
