@@ -1,10 +1,11 @@
 import json
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, private, _chunk
+from telegram_chat_bot import State, Settings, complete, handle_message, private, _chunk
 
 
 def test_private_filter():
@@ -333,14 +334,6 @@ async def test_handle_message_ignores_non_private_chat():
 
     # No reply should have been sent
     mock_update.message.reply_text.assert_not_called()
-
-
-import asyncio
-import time
-
-from unittest.mock import AsyncMock
-
-from telegram_chat_bot import handle_message
 
 
 @pytest.mark.asyncio
@@ -729,3 +722,174 @@ def test_settings_invalid_negative_inf_interval_raises():
             Settings(token="test_token")
         assert "MODEL_REQUEST_INTERVAL" in str(exc.value)
         assert "must be positive" in str(exc.value)
+
+
+def test_registration_store_persists_status(tmp_path):
+    from telegram_chat_bot import RegistrationStore
+
+    path = tmp_path / "registrations.json"
+    store = RegistrationStore(str(path))
+    store.set_status(123, "pending")
+    assert store.status(123) == "pending"
+
+    restored = RegistrationStore(str(path))
+    assert restored.status(123) == "pending"
+    assert restored.users("pending") == [123]
+
+
+@pytest.mark.asyncio
+async def test_start_creates_pending_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+
+    assert state.registrations.status(123) == "pending"
+    update.message.reply_text.assert_awaited_once_with(
+        "Your access request was recorded and is pending administrator approval."
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_registration_is_allowed(tmp_path):
+    from telegram_chat_bot import Settings, State
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "approved")
+    assert state.allowed(123)
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_approve_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, approve
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = ["123"]
+    context.application.bot_data = {"state": state}
+
+    await approve(update, context)
+
+    assert state.registrations.status(123) is None
+    update.message.reply_text.assert_awaited_once_with("Only administrators can approve users.")
+
+
+@pytest.mark.asyncio
+async def test_start_repeat_registration_is_pending(tmp_path):
+    from telegram_chat_bot import Settings, State, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "pending")
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+
+    update.message.reply_text.assert_awaited_once_with(
+        "Your access request is still pending administrator approval."
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_can_approve_and_reject_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, approve, reject
+
+    settings = Settings(token="test", admin_user_ids=frozenset({999}), registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "pending")
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = ["123"]
+    context.application.bot_data = {"state": state}
+
+    await approve(update, context)
+    assert state.registrations.status(123) == "approved"
+    await reject(update, context)
+    assert state.registrations.status(123) == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_rejected_registration_cannot_start_or_chat(tmp_path):
+    from telegram_chat_bot import Settings, State, handle_message, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "rejected")
+    update = MagicMock()
+    update.effective_chat.type = "private"
+    update.effective_user.id = 123
+    update.message.text = "hello"
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+    await handle_message(update, context)
+
+    assert state.registrations.status(123) == "rejected"
+    assert list(state.history[123]) == []
+    update.message.reply_text.assert_awaited_once_with(
+        "Your access request was rejected by an administrator."
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_can_list_and_revoke_users(tmp_path):
+    from telegram_chat_bot import Settings, State, revoke, users
+
+    settings = Settings(token="test", admin_user_ids=frozenset({999}), registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    state.registrations.set_status(123, "pending")
+    state.registrations.set_status(456, "approved")
+    update = MagicMock()
+    update.effective_user.id = 999
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = []
+    context.application.bot_data = {"state": state}
+
+    await users(update, context)
+    update.message.reply_text.assert_awaited_once_with("Pending: 123\nApproved: 456")
+    context.args = ["456"]
+    await revoke(update, context)
+    assert state.registrations.status(456) == "rejected"
+    update.message.reply_text.assert_awaited_with("User 456 revoked.")
+
+
+@pytest.mark.asyncio
+async def test_start_parameter_is_rejected_without_registration(tmp_path):
+    from telegram_chat_bot import Settings, State, start
+
+    settings = Settings(token="test", registration_file=str(tmp_path / "registrations.json"))
+    state = State(settings)
+    update = MagicMock()
+    update.effective_user.id = 123
+    update.message.reply_text = AsyncMock()
+    context = MagicMock()
+    context.args = ["invite-code"]
+    context.application.bot_data = {"state": state}
+
+    await start(update, context)
+
+    assert state.registrations.status(123) is None
+    update.message.reply_text.assert_awaited_once_with(
+        "This bot does not support /start parameters. Send /start without additional text to request access."
+    )
