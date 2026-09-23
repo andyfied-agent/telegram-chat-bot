@@ -12,7 +12,8 @@ import pytest
 from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, complete,
                                complete_with_usage, private, _chunk, log_provider_failure,
                                get_provider_failures, _provider_failures,
-                               _truncate_history_by_limit, _write_state_atomic, _read_state)
+                               _truncate_history_by_limit, _write_state_atomic, _read_state,
+                               handle_message)
 
 
 def test_private_filter():
