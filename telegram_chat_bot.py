@@ -12,7 +12,9 @@ import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -73,6 +75,44 @@ def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool =
     if math.isnan(num) or math.isinf(num):
         raise ValueError(f"{setting_name} must be a finite positive value, got {value!r}")
     return num
+
+
+def _validate_limit_setting(value: str, setting_name: str) -> int:
+    """Validate a daily limit, where zero means unlimited."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{setting_name} must be a non-negative integer, got {value!r}")
+    if limit < 0:
+        raise ValueError(f"{setting_name} must be non-negative, got {limit}")
+    return limit
+
+
+def _parse_bool_setting(value: str, setting_name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{setting_name} must be a boolean, got {value!r}")
+
+
+def _parse_provider_limits(value: str) -> dict[str, int]:
+    """Parse JSON provider limits without accepting malformed configuration."""
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("PROVIDER_DAILY_LIMITS must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("PROVIDER_DAILY_LIMITS must be a JSON object")
+    limits: dict[str, int] = {}
+    for provider, limit in parsed.items():
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("PROVIDER_DAILY_LIMITS provider names must be non-empty strings")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("PROVIDER_DAILY_LIMITS values must be non-negative integers")
+        limits[provider] = limit
+    return limits
 
 
 _state_lock = asyncio.Lock()
@@ -139,6 +179,11 @@ class Settings:
     ))
     state_file: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_BOT_STATE_FILE", os.path.expanduser("~/.telegram-chat-bot/state.json")))
     max_history: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("TELEGRAM_CHAT_BOT_MAX_HISTORY", "100"), "TELEGRAM_CHAT_BOT_MAX_HISTORY"))
+    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "llama.cpp"))
+    default_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("DEFAULT_DAILY_REQUEST_LIMIT", "0"), "DEFAULT_DAILY_REQUEST_LIMIT"))
+    provider_daily_limits: dict[str, int] = field(default_factory=lambda: _parse_provider_limits(os.getenv("PROVIDER_DAILY_LIMITS", "{}")))
+    openrouter_enabled: bool = field(default_factory=lambda: _parse_bool_setting(os.getenv("OPENROUTER_ENABLED", "false"), "OPENROUTER_ENABLED"))
+    openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
 
 
 class RegistrationStore:
@@ -179,7 +224,18 @@ class RegistrationStore:
             Path(temporary).unlink(missing_ok=True)
 
 
-def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+@dataclass(frozen=True)
+class CompletionResult:
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+def complete_with_usage(settings: Settings, messages: list[dict[str, str]]) -> CompletionResult:
     """Make a model request with an independent timeout.
 
     Uses a ThreadPoolExecutor to run the HTTP request in a separate thread
@@ -201,7 +257,17 @@ def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
         text = data["choices"][0]["message"].get("content", "").strip()
         if not text:
             raise ValueError("empty model response")
-        return text[: settings.max_chars]
+        usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise ValueError("invalid token usage in model response")
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        if (isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int)
+                or prompt_tokens < 0 or isinstance(completion_tokens, bool)
+                or not isinstance(completion_tokens, int) or completion_tokens < 0):
+            raise ValueError("invalid token usage in model response")
+        return CompletionResult(text=text[: settings.max_chars], prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens)
 
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(do_request)
@@ -217,6 +283,11 @@ def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
         # deadline. The request itself has the same socket timeout and the
         # future is cancelled when it has not started yet.
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+    """Return only the response text for callers using the legacy API."""
+    return complete_with_usage(settings, messages).text
 
 
 def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
@@ -242,6 +313,138 @@ def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
         return "unreachable", False
 
 
+@dataclass
+class UsageRecord:
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+class UsageState:
+    """Durable per-user, per-provider daily request and token accounting."""
+
+    def __init__(self, settings: Settings, clock: Callable[[], float] = time.time) -> None:
+        self.settings = settings
+        self._clock = clock
+        self.records: dict[str, dict[str, UsageRecord]] = defaultdict(dict)
+        self.provider_requests: dict[str, dict[str, int]] = defaultdict(dict)
+
+    def date_key(self) -> str:
+        return datetime.fromtimestamp(self._clock()).date().isoformat()
+
+    @staticmethod
+    def _record_key(user_id: int, provider: str) -> str:
+        return f"{user_id}:{provider}"
+
+    def _get_record(self, user_id: int, provider: str, day: str | None = None) -> UsageRecord:
+        day = day or self.date_key()
+        key = self._record_key(user_id, provider)
+        return self.records.setdefault(day, {}).setdefault(key, UsageRecord())
+
+    def limit_for(self, provider: str) -> int:
+        if provider == "openrouter" and self.settings.openrouter_enabled:
+            return self.settings.default_daily_request_limit
+        if provider in self.settings.provider_daily_limits:
+            return self.settings.provider_daily_limits[provider]
+        return self.settings.default_daily_request_limit
+
+    def account_limit_for(self, provider: str) -> int:
+        if provider != "openrouter" or not self.settings.openrouter_enabled:
+            return 0
+        return self.settings.provider_daily_limits.get(provider, self.settings.openrouter_daily_request_limit)
+
+    def reserve_request(self, user_id: int, provider: str) -> tuple[bool, int, int]:
+        """Reserve one outbound request and return (allowed, limit, remaining)."""
+        record = self._get_record(user_id, provider)
+        user_limit = self.limit_for(provider)
+        account_limit = self.account_limit_for(provider)
+        account_count = self.provider_requests.setdefault(self.date_key(), {}).get(provider, 0)
+        if user_limit and record.request_count >= user_limit:
+            return False, user_limit, 0
+        if account_limit and account_count >= account_limit:
+            return False, account_limit, 0
+        record.request_count += 1
+        if account_limit:
+            self.provider_requests[self.date_key()][provider] = account_count + 1
+        user_remaining = max(0, user_limit - record.request_count) if user_limit else None
+        account_remaining = max(0, account_limit - account_count - 1) if account_limit else None
+        remaining = min(value for value in (user_remaining, account_remaining) if value is not None) if (user_remaining is not None or account_remaining is not None) else 0
+        return True, account_limit or user_limit, remaining
+
+    def record_tokens(self, user_id: int, provider: str, prompt_tokens: int, completion_tokens: int) -> None:
+        if (isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0
+                or isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int)
+                or completion_tokens < 0):
+            raise ValueError("token counts must be non-negative integers")
+        record = self._get_record(user_id, provider)
+        record.prompt_tokens += prompt_tokens
+        record.completion_tokens += completion_tokens
+
+    def stats(self, user_id: int, provider: str) -> dict[str, int | str | None]:
+        record = self._get_record(user_id, provider)
+        user_limit = self.limit_for(provider)
+        account_limit = self.account_limit_for(provider)
+        account_requests = self.provider_requests.get(self.date_key(), {}).get(provider, 0)
+        limits = [value for value in (user_limit, account_limit) if value]
+        remaining_values = []
+        if user_limit:
+            remaining_values.append(max(0, user_limit - record.request_count))
+        if account_limit:
+            remaining_values.append(max(0, account_limit - account_requests))
+        remaining = min(remaining_values) if remaining_values else None
+        return {
+            "date": self.date_key(), "user_id": user_id, "provider": provider,
+            "request_count": record.request_count, "prompt_tokens": record.prompt_tokens,
+            "completion_tokens": record.completion_tokens, "total_tokens": record.total_tokens,
+            "limit": max(limits) if limits else 0, "remaining": remaining,
+            "account_limit": account_limit, "account_requests": account_requests,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "records": {
+                day: {
+                key: {"request_count": record.request_count,
+                      "prompt_tokens": record.prompt_tokens,
+                      "completion_tokens": record.completion_tokens}
+                for key, record in records.items()
+                }
+            for day, records in self.records.items()
+            },
+            "provider_requests": {
+                day: dict(providers) for day, providers in self.provider_requests.items()
+            },
+        }
+
+    def load_dict(self, data: object) -> None:
+        if not isinstance(data, dict):
+            return
+        raw_records = data.get("records", data) if isinstance(data, dict) else {}
+        raw_provider_requests = data.get("provider_requests", {}) if isinstance(data, dict) else {}
+        for day, providers in raw_provider_requests.items():
+            if not isinstance(day, str) or not isinstance(providers, dict):
+                continue
+            for provider, count in providers.items():
+                if isinstance(provider, str) and isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    self.provider_requests[day][provider] = count
+        for day, day_data in raw_records.items():
+            if not isinstance(day, str) or not isinstance(day_data, dict):
+                continue
+            for key, raw_record in day_data.items():
+                if not isinstance(key, str) or not isinstance(raw_record, dict):
+                    continue
+                counts = {name: raw_record.get(name, 0)
+                          for name in ("request_count", "prompt_tokens", "completion_tokens")}
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                       for value in counts.values()):
+                    continue
+                self.records[day][key] = UsageRecord(**counts)
+
+
 class State:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -253,6 +456,7 @@ class State:
         self.last_request: dict[int, float] = {}
         self.request_gate = asyncio.Semaphore(1)
         self.registrations = RegistrationStore(settings.registration_file)
+        self.usage = UsageState(settings)
         self._persisted = False
 
     def _load(self) -> None:
@@ -269,6 +473,7 @@ class State:
             truncated = _truncate_history_by_limit(msgs, self.settings.max_history)
             self.history[user_id] = deque(truncated, maxlen=self.settings.max_messages)
         self.last_request = {int(k): v for k, v in data.get("last_request", {}).items()}
+        self.usage.load_dict(data.get("usage", {}))
         self._persisted = True
 
     def _dump(self) -> None:
@@ -278,6 +483,7 @@ class State:
             "private_prompts": self.private_prompts,
             "user_history": {str(uid): list(msgs) for uid, msgs in self.history.items()},
             "last_request": self.last_request,
+            "usage": self.usage.to_dict(),
         }
         _write_state_atomic(self.settings.state_file, data)
 
@@ -452,7 +658,23 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /usage /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+
+
+async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.allowed(user_id):
+        return
+    stats = state.usage.stats(user_id, state.settings.provider)
+    remaining = "unlimited" if stats["remaining"] is None else str(stats["remaining"])
+    await update.message.reply_text(
+        f"Usage for {stats['date']} ({stats['provider']}):\n"
+        f"Requests: {stats['request_count']}/{stats['limit'] or 'unlimited'}\n"
+        f"Remaining: {remaining}\n"
+        f"Tokens: {stats['total_tokens']} ({stats['prompt_tokens']} prompt, "
+        f"{stats['completion_tokens']} completion)"
+    )
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
@@ -480,26 +702,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
         await update.message.reply_text("Please wait a moment before sending another message.")
         return
+    provider = state.settings.provider
+    allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
+    if not allowed:
+        await update.message.reply_text(
+            f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
+        )
+        return
     state.last_request[user_id] = now
     state.history[user_id].append({"role": "user", "content": text})
+    await state.persist()
     try:
         async with state.request_gate:
-            response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
+            result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id))
     except ProviderTimeoutError:
         state.history[user_id].pop()
-        log_provider_failure("llama.cpp", "timeout")
+        log_provider_failure(provider, "timeout")
         logger.exception("llama.cpp request timed out for user %s", user_id)
+        await state.persist()
         await update.message.reply_text("The model request timed out. Please try again shortly.")
         return
     except RuntimeError:
         state.history[user_id].pop()
-        log_provider_failure("llama.cpp", "request_failed")
+        log_provider_failure(provider, "request_failed")
         logger.exception("llama.cpp request failed for user %s", user_id)
+        await state.persist()
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
         return
-    state.history[user_id].append({"role": "assistant", "content": response})
+    state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
+    state.history[user_id].append({"role": "assistant", "content": result.text})
     await state.persist()
-    chunks = _chunk(response)
+    chunks = _chunk(result.text)
     for chunk in chunks:
         await update.message.reply_text(chunk)
 
@@ -518,7 +751,7 @@ def main() -> None:
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
-                "shutdown": shutdown, "help": help_command}
+                "shutdown": shutdown, "help": help_command, "usage": usage}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))

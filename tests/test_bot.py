@@ -1,13 +1,18 @@
+import asyncio
 import json
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, private, _chunk, log_provider_failure, get_provider_failures, _provider_failures, _truncate_history_by_limit, _write_state_atomic, _read_state
+from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, complete,
+                               complete_with_usage, private, _chunk, log_provider_failure,
+                               get_provider_failures, _provider_failures,
+                               _truncate_history_by_limit, _write_state_atomic, _read_state)
 
 
 def test_private_filter():
@@ -445,7 +450,7 @@ async def test_handle_message_model_failure_rollback():
     mock_context = MagicMock()
     mock_context.application.bot_data = {"state": state}
 
-    with patch("telegram_chat_bot.complete", side_effect=RuntimeError("model request failed")):
+    with patch("telegram_chat_bot.complete_with_usage", side_effect=RuntimeError("model request failed")):
         await handle_message(mock_update, mock_context)
 
     mock_update.message.reply_text.assert_called_once_with(
@@ -1247,3 +1252,46 @@ def test_settings_negative_max_history_raises():
         with pytest.raises(ValueError) as exc:
             Settings(token='test_token')
         assert "must be positive" in str(exc.value)
+
+
+def test_openrouter_account_limit_is_shared_across_users():
+    settings = Settings(token="test", openrouter_enabled=True, default_daily_request_limit=0)
+    usage = UsageState(settings, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+
+    for request_number in range(49):
+        assert usage.reserve_request(100 if request_number % 2 else 200, "openrouter")[0] is True
+
+    assert usage.reserve_request(100, "openrouter")[0] is True
+    allowed, limit, remaining = usage.reserve_request(200, "openrouter")
+    assert (allowed, limit, remaining) == (False, 50, 0)
+    assert usage.stats(100, "openrouter")["account_requests"] == 50
+
+
+def test_usage_state_records_tokens_and_persists_with_registration_state(tmp_path):
+    state_file = tmp_path / "state.json"
+    registration_file = tmp_path / "registrations.json"
+    settings = Settings(token="test", state_file=str(state_file), registration_file=str(registration_file))
+    state = State(settings)
+    state.usage.reserve_request(123, "llama.cpp")
+    state.usage.record_tokens(123, "llama.cpp", 12, 34)
+    asyncio.run(state.persist())
+
+    restored = State(settings)
+    restored._load()
+    stats = restored.usage.stats(123, "llama.cpp")
+    assert stats["request_count"] == 1
+    assert stats["total_tokens"] == 46
+
+
+@patch("telegram_chat_bot.urlopen")
+def test_complete_with_usage_reads_provider_token_counts(mock_urlopen):
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 5},
+    }).encode()
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    result = complete_with_usage(Settings(token="test"), [{"role": "user", "content": "hi"}])
+    assert result == CompletionResult("ok", 7, 5)
+    assert result.total_tokens == 12

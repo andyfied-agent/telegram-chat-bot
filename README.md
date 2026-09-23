@@ -133,11 +133,28 @@ The bot registers the following handlers:
 - /status -> status -- Model + history window
 - /reset -> reset -- Clear conversation history
 - /history -> history -- Report memory size
+- /usage -> usage -- Report today's request and token usage
 - /addglobalprompt -> addglobalprompt -- Set global system prompt
 - /addprivateprompt -> addprivateprompt -- Set per-user private prompt
 - /shutdown -> shutdown -- Refused remotely
 - /help -> help_command -- List commands
 - text (non-command) -> handle_message -- Chat completion via llama.cpp
+
+## Usage accounting and quotas
+
+The bot stores daily request and token counters in the same atomically-written
+state file as conversation state. Counters are keyed by Telegram user and
+provider. An outbound request consumes one request quota even when the provider
+fails; prompt and completion token counters are updated from successful
+provider responses that include usage data. A limit of `0` means unlimited.
+
+Set `DEFAULT_DAILY_REQUEST_LIMIT` for the default provider and use the JSON
+`PROVIDER_DAILY_LIMITS` map for provider-specific overrides. If
+`OPENROUTER_ENABLED=true`, OpenRouter defaults to its documented 50-request
+daily account limit, configurable with `OPENROUTER_DAILY_REQUEST_LIMIT`.
+OpenRouter's account counter is shared across Telegram users while the
+per-user counters remain available for reporting. The `/usage` command reports
+the current provider's counters for the requesting user.
 
 ## Chunking
 
