@@ -7,12 +7,12 @@ import logging
 import os
 import sys
 import math
+import tempfile
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
-import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -75,6 +75,50 @@ def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool =
     return num
 
 
+_state_lock = asyncio.Lock()
+
+
+def _write_state_atomic(state_file: str, data: dict) -> None:
+    """Write state atomically with restrictive permissions (0o600)."""
+    dir_path = Path(state_file).parent
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(dir_path), prefix=".state-", suffix=".tmp"
+    )
+    temp_file = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, state_file)
+    except Exception:
+        try:
+            temp_file.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _read_state(state_file: str) -> dict:
+    """Read state from file, returning empty dict if not found."""
+    try:
+        with open(state_file, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _truncate_history_by_limit(history: list[dict], max_history: int) -> list[dict]:
+    """Truncate history to max_history entries, keeping newest entries."""
+    if len(history) <= max_history:
+        return history
+    # Retain the most recent messages.
+    return history[-max_history:]
+
+
 @dataclass(frozen=True)
 class Settings:
     token: str
@@ -93,6 +137,8 @@ class Settings:
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
     ))
+    state_file: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_BOT_STATE_FILE", os.path.expanduser("~/.telegram-chat-bot/state.json")))
+    max_history: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("TELEGRAM_CHAT_BOT_MAX_HISTORY", "100"), "TELEGRAM_CHAT_BOT_MAX_HISTORY"))
 
 
 class RegistrationStore:
@@ -207,6 +253,44 @@ class State:
         self.last_request: dict[int, float] = {}
         self.request_gate = asyncio.Semaphore(1)
         self.registrations = RegistrationStore(settings.registration_file)
+        self._persisted = False
+
+    def _load(self) -> None:
+        """Load state from file on disk."""
+        if self._persisted:
+            return
+        data = _read_state(self.settings.state_file)
+        self.global_prompt = data.get("global_prompt", "")
+        self.private_prompts = {int(k): v for k, v in data.get("private_prompts", {}).items()}
+        user_history = data.get("user_history", {})
+        for user_id_str, msgs in user_history.items():
+            user_id = int(user_id_str)
+            # Truncate to max_history limit if exceeded
+            truncated = _truncate_history_by_limit(msgs, self.settings.max_history)
+            self.history[user_id] = deque(truncated, maxlen=self.settings.max_messages)
+        self.last_request = {int(k): v for k, v in data.get("last_request", {}).items()}
+        self._persisted = True
+
+    def _dump(self) -> None:
+        """Dump state to file atomically with restrictive permissions."""
+        data = {
+            "global_prompt": self.global_prompt,
+            "private_prompts": self.private_prompts,
+            "user_history": {str(uid): list(msgs) for uid, msgs in self.history.items()},
+            "last_request": self.last_request,
+        }
+        _write_state_atomic(self.settings.state_file, data)
+
+    async def persist(self) -> None:
+        """Persist state to disk atomically."""
+        async with _state_lock:
+            self._dump()
+
+    async def reset(self, user_id: int) -> None:
+        """Reset user state: clear history and last_request."""
+        self.history.pop(user_id, None)
+        self.last_request.pop(user_id, None)
+        await self.persist()
 
     def allowed(self, user_id: int) -> bool:
         return user_id in self.settings.allowed_user_ids or self.registrations.status(user_id) == "approved"
@@ -320,7 +404,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     if not state.allowed(update.effective_user.id):
         return
-    state.history.pop(update.effective_user.id, None)
+    await state.reset(update.effective_user.id)
     await update.message.reply_text("Your conversation context has been reset.")
 
 
@@ -342,6 +426,7 @@ async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Usage: /addglobalprompt <prompt>")
         return
     state.global_prompt = prompt[: state.settings.max_chars]
+    await state.persist()
     await update.message.reply_text("Global prompt updated.")
 
 
@@ -354,6 +439,7 @@ async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Usage: /addprivateprompt <prompt>")
         return
     state.private_prompts[update.effective_user.id] = prompt[: state.settings.max_chars]
+    await state.persist()
     await update.message.reply_text("Private prompt updated.")
 
 
@@ -412,6 +498,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
         return
     state.history[user_id].append({"role": "assistant", "content": response})
+    await state.persist()
     chunks = _chunk(response)
     for chunk in chunks:
         await update.message.reply_text(chunk)
@@ -425,6 +512,8 @@ def main() -> None:
     settings = Settings(token=token)
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
+    # Load persisted state on startup
+    app.bot_data["state"]._load()
     only_private = private()
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "reset": reset, "history": history,

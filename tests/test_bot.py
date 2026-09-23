@@ -1,11 +1,13 @@
 import json
+import os
+import tempfile
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, private, _chunk, log_provider_failure, get_provider_failures, _provider_failures
+from telegram_chat_bot import State, Settings, complete, private, _chunk, log_provider_failure, get_provider_failures, _provider_failures, _truncate_history_by_limit, _write_state_atomic, _read_state
 
 
 def test_private_filter():
@@ -953,3 +955,295 @@ async def test_start_parameter_is_rejected_without_registration(tmp_path):
     update.message.reply_text.assert_awaited_once_with(
         "This bot does not support /start parameters. Send /start without additional text to request access."
     )
+# --- Persistent state tests ---
+
+
+class TestPersistentState:
+    """Tests for issue #11: persistent conversation state."""
+
+    def test_settings_state_file_default(self):
+        """Default state_file points to ~/.telegram-chat-bot/state.json."""
+        with patch("os.path.expanduser", return_value="/home/test/.telegram-chat-bot/state.json"):
+            settings = Settings(token='test')
+        assert settings.state_file == "/home/test/.telegram-chat-bot/state.json"
+
+    def test_settings_custom_state_file(self):
+        """Custom state_file can be set via environment variable."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_STATE_FILE': '/custom/path/state.json'}):
+            settings = Settings(token='test')
+        assert settings.state_file == '/custom/path/state.json'
+
+    def test_settings_max_history_default(self):
+        """Default max_history is 100."""
+        settings = Settings(token='test')
+        assert settings.max_history == 100
+
+    def test_settings_custom_max_history(self):
+        """Custom max_history can be set via environment variable."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': '50'}):
+            settings = Settings(token='test')
+        assert settings.max_history == 50
+
+    def test_settings_invalid_max_history_raises(self):
+        """Invalid max_history must raise ValueError."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': 'abc'}):
+            with pytest.raises(ValueError) as exc:
+                Settings(token='test')
+        assert "TELEGRAM_CHAT_BOT_MAX_HISTORY" in str(exc.value)
+
+    def test_settings_zero_max_history_raises(self):
+        """Zero max_history must raise ValueError."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': '0'}):
+            with pytest.raises(ValueError) as exc:
+                Settings(token='test')
+        assert "must be positive" in str(exc.value)
+
+    def test_truncate_history_within_limit(self):
+        """History within limit is unchanged."""
+        history = [{'role': 'user', 'content': 'msg1'}, {'role': 'assistant', 'content': 'msg2'}]
+        result = _truncate_history_by_limit(history, 100)
+        assert result == history
+
+    def test_truncate_history_at_limit(self):
+        """History at limit is unchanged."""
+        history = [{'role': 'user', 'content': f'msg{i}'} for i in range(10)]
+        result = _truncate_history_by_limit(history, 10)
+        assert result == history
+
+    def test_truncate_history_over_limit(self):
+        """History over limit is truncated, keeping oldest entries."""
+        history = [{'role': 'user', 'content': f'msg{i}'} for i in range(20)]
+        result = _truncate_history_by_limit(history, 10)
+        assert len(result) == 10
+        # Slice from back gives us msgs 10-19
+        for i in range(10):
+            assert result[i]['content'] == f'msg{10 + i}'
+
+    @pytest.mark.asyncio
+    async def test_state_load_nonexistent_file(self):
+        """State load from nonexistent file returns empty state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            f.write(b'')
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == ''
+            assert state.private_prompts == {}
+            assert state.history == {}
+            assert state.last_request == {}
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_invalid_json(self):
+        """State load from invalid JSON returns empty state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            f.write('not valid json')
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == ''
+            assert state.private_prompts == {}
+            assert state.history == {}
+            assert state.last_request == {}
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_valid_json(self):
+        """State load from valid JSON restores state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            json.dump({
+                "global_prompt": "Test global",
+                "private_prompts": {"123": "Private for 123", "456": "Private for 456"},
+                "user_history": {"123": [{"role": "user", "content": "Hi"}]},
+                "last_request": {"123": 12345.0}
+            }, f)
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == "Test global"
+            assert state.private_prompts[123] == "Private for 123"
+            assert state.private_prompts[456] == "Private for 456"
+            assert len(state.history[123]) == 1
+            assert state.history[123][0]['content'] == "Hi"
+            assert state.last_request[123] == 12345.0
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_truncates_history(self):
+        """State load truncates history to max_history limit, keeping oldest entries."""
+        history = [{"role": "user", "content": f"msg{i}"} for i in range(200)]
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            json.dump({
+                "user_history": {"123": history}
+            }, f)
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path, max_history=50)
+            state = State(settings)
+            state._load()
+            # deque(maxlen=20) means it keeps latest 20 from the truncated list
+            assert len(state.history[123]) == 20
+            # Should have kept oldest 50 from 200, then deque keeps newest 20 of those
+            # Oldest 50 from 200 are msgs 150-199
+            # Newest 20 of those are msgs 180-199
+            assert state.history[123][0]['content'] == "msg180"
+            assert state.history[123][19]['content'] == "msg199"
+        finally:
+            os.unlink(temp_path)
+
+    def test_write_state_atomic_creates_dir(self):
+        """_write_state_atomic creates parent directories."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "subdir", "state.json")
+            _write_state_atomic(state_file, {"test": "value"})
+            assert os.path.exists(state_file)
+
+    def test_write_state_atomic_sets_permissions(self):
+        """_write_state_atomic sets restrictive permissions (0o600)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            _write_state_atomic(temp_path, {"test": "value"})
+            mode = os.stat(temp_path).st_mode & 0o777
+            assert mode == 0o600
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def test_write_state_atomic_atomic(self):
+        """_write_state_atomic uses atomic rename."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            _write_state_atomic(temp_path, {"step1": True})
+            # Read and verify
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data == {"step1": True}
+            # Write again
+            _write_state_atomic(temp_path, {"step2": True})
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data == {"step2": True}
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_persist(self):
+        """State persist writes state to file."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state.global_prompt = "Test prompt"
+            state.private_prompts[123] = "Private"
+            state.history[123].append({"role": "user", "content": "Hi"})
+            await state.persist()
+            # Verify file was written
+            assert os.path.exists(temp_path)
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data["global_prompt"] == "Test prompt"
+            assert data["private_prompts"]["123"] == "Private"
+            assert len(data["user_history"]["123"]) == 1
+            # Verify permissions
+            mode = os.stat(temp_path).st_mode & 0o777
+            assert mode == 0o600
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_reset(self):
+        """State reset clears user history and last_request, and persists."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state.history[123].append({"role": "user", "content": "Hi"})
+            state.last_request[123] = 12345.0
+            await state.persist()
+            # Verify persisted
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert "123" in data["user_history"]
+            assert "123" in data["last_request"]
+            # Now reset
+            await state.reset(123)
+            # Verify cleared
+            assert 123 not in state.history
+            assert 123 not in state.last_request
+            # Verify persisted
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert "123" not in data["user_history"]
+            assert "123" not in data["last_request"]
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+# ---- Numeric setting validation tests for new settings ----
+
+
+def test_settings_invalid_state_file_max_history_raises():
+    """Invalid TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': 'abc',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "TELEGRAM_CHAT_BOT_MAX_HISTORY" in str(exc.value)
+
+
+def test_settings_zero_state_file_max_history_raises():
+    """Zero TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '0',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "must be positive" in str(exc.value)
+
+
+def test_settings_valid_max_history():
+    """Valid TELEGRAM_CHAT_BOT_MAX_HISTORY is accepted."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '200',
+    }):
+        settings = Settings(token='test_token')
+    assert settings.max_history == 200
+
+
+def test_settings_negative_max_history_raises():
+    """Negative TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '-5',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "must be positive" in str(exc.value)
