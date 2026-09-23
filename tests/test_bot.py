@@ -5,7 +5,7 @@ from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, handle_message, private, _chunk
+from telegram_chat_bot import State, Settings, complete, private, _chunk, log_provider_failure, get_provider_failures, _provider_failures
 
 
 def test_private_filter():
@@ -289,10 +289,75 @@ def test_chunk_single_chunk_preserved():
     assert chunks == [text]
 
 
+# ---- Provider resilience tests ----
+
+
+def test_log_provider_failure():
+    """Test that provider failures are logged without exposing URLs or credentials."""
+    # Clear any existing failures
+    _provider_failures.clear()
+
+    log_provider_failure("llama.cpp", "timeout")
+    failures = get_provider_failures()
+
+    assert len(failures) == 1
+    assert failures[0].provider == "llama.cpp"
+    assert failures[0].error_type == "timeout"
+    # Should not contain any URL or credential information
+    assert "http" not in str(failures[0])
+    assert "token" not in str(failures[0]).lower()
+
+
+def test_get_provider_failures_isolation():
+    """Test that get_provider_failures returns a copy, not the original list."""
+    _provider_failures.clear()
+    log_provider_failure("test", "error1")
+
+    failures1 = get_provider_failures()
+    failures2 = get_provider_failures()
+
+    assert failures1 is not failures2
+    assert failures1 == failures2
+
+
+def test_complete_independent_timeout():
+    """Test that complete() has an independent timeout mechanism.
+
+    The implementation uses ThreadPoolExecutor with a timeout parameter
+    to ensure a stalled provider cannot block the request indefinitely.
+    """
+    import time
+    from unittest.mock import patch, MagicMock
+
+    # Create a settings object with a very short timeout
+    settings = Settings(token="test", timeout=0.1)
+
+    mock_response = MagicMock()
+
+    def slow_request():
+        time.sleep(10)  # Simulate a very slow/stalled request
+        return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    mock_response.read.side_effect = slow_request
+
+    with patch('telegram_chat_bot.urlopen') as mock_urlopen:
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        # The request should timeout, not hang
+        start = time.time()
+        try:
+            complete(settings, [{"role": "user", "content": "test"}])
+            assert False, "Expected RuntimeError"
+        except RuntimeError as e:
+            elapsed = time.time() - start
+            # Should have timed out, not waited for the full 10 seconds
+            assert elapsed < 3, f"Request took {elapsed}s, expected timeout"
+
+
 @pytest.mark.asyncio
 async def test_handle_message_rejects_unallowlisted_user():
     """handle_message must return early without any reply when user is not allowlisted."""
-    from telegram_chat_bot import handle_message
+    from telegram_chat_bot import handle_message, State
 
     # No env set → allowed_user_ids is empty → everyone rejected
     settings = Settings(token='test_token')
@@ -316,7 +381,7 @@ async def test_handle_message_rejects_unallowlisted_user():
 @pytest.mark.asyncio
 async def test_handle_message_ignores_non_private_chat():
     """handle_message must ignore group/supergroup/channel messages entirely."""
-    from telegram_chat_bot import handle_message
+    from telegram_chat_bot import handle_message, State
 
     settings = Settings(token='test_token')
     state = State(settings)
@@ -340,8 +405,6 @@ async def test_handle_message_ignores_non_private_chat():
 async def test_handle_message_rate_limiting():
     """A second request within the interval gets the wait reply and does NOT call
     the model or add history."""
-    from telegram_chat_bot import Settings, State
-
     settings = Settings(token='test', allowed_user_ids=frozenset({123}), request_interval=5.0)
     state = State(settings)
     state.last_request[123] = time.monotonic()
@@ -367,8 +430,6 @@ async def test_handle_message_rate_limiting():
 async def test_handle_message_model_failure_rollback():
     """When the model raises, the user message is removed from history and an
     error reply is sent."""
-    from telegram_chat_bot import Settings, State
-
     settings = Settings(token='test', allowed_user_ids=frozenset({123}))
     state = State(settings)
     state.last_request[123] = 0
@@ -386,7 +447,7 @@ async def test_handle_message_model_failure_rollback():
         await handle_message(mock_update, mock_context)
 
     mock_update.message.reply_text.assert_called_once_with(
-        "I couldn\'t reach the local model. Please try again shortly."
+        "I couldn't reach the local model. Please try again shortly."
     )
     assert len(state.history[123]) == 0
 
@@ -650,7 +711,7 @@ def test_validate_numeric_setting_inf_raises():
 
 def test_validate_numeric_setting_negative_inf_raises():
     """-inf must be rejected with a descriptive ValueError.
-    
+
     -inf is <= 0 so gets caught by the positive check first.
     """
     from telegram_chat_bot import _validate_numeric_setting
@@ -670,7 +731,7 @@ def test_validate_numeric_setting_infinity_raises():
 
 def test_validate_numeric_setting_negative_infinity_raises():
     """'-Infinity' must be rejected.
-    
+
     Like -inf, -Infinity <= 0 so the positive check catches it.
     """
     from telegram_chat_bot import _validate_numeric_setting
@@ -682,7 +743,7 @@ def test_validate_numeric_setting_negative_infinity_raises():
 
 def test_settings_invalid_nan_timeout_raises():
     """LLAMA_CPP_TIMEOUT=nan must raise ValueError at Settings init.
-    
+
     LLAMA_CPP_TIMEOUT is validated as int, so "nan" is caught by the
     non-numeric path (int("nan") raises ValueError).
     """
@@ -702,7 +763,6 @@ def test_settings_invalid_inf_interval_raises():
         assert "finite positive value" in str(exc.value)
 
 
-
 def test_settings_invalid_nan_interval_raises():
     """MODEL_REQUEST_INTERVAL=nan must raise ValueError (as_float=True path)."""
     with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "nan"}):
@@ -714,7 +774,7 @@ def test_settings_invalid_nan_interval_raises():
 
 def test_settings_invalid_negative_inf_interval_raises():
     """MODEL_REQUEST_INTERVAL=-inf must raise ValueError (as_float=True path).
-    
+
     -inf is <= 0, so the "must be positive" check catches it.
     """
     with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "-inf"}):

@@ -9,6 +9,7 @@ import sys
 import math
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
@@ -23,6 +24,35 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+@dataclass(frozen=True)
+class ProviderFailure:
+    """Record a provider failure without exposing credentials or URLs."""
+    provider: str
+    error_type: str
+    timestamp: float = field(default_factory=time.time)
+
+    def __str__(self) -> str:
+        return f"{self.provider} failed: {self.error_type} at {self.timestamp}"
+
+
+# Global failure log (in-memory, no credentials/URLs stored)
+_provider_failures: list[ProviderFailure] = []
+
+
+def log_provider_failure(provider: str, error_type: str) -> None:
+    """Log a provider failure without exposing credentials or request URLs."""
+    failure = ProviderFailure(provider=provider, error_type=error_type)
+    _provider_failures.append(failure)
+    logger.warning("%s", failure)
+
+
+def get_provider_failures() -> list[ProviderFailure]:
+    """Return the list of recorded provider failures."""
+    return _provider_failures[:]
+
+
+class ProviderTimeoutError(RuntimeError):
+    """Raised when the bounded provider request exceeds its timeout."""
 
 
 def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool = False) -> float:
@@ -104,23 +134,43 @@ class RegistrationStore:
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+    """Make a model request with an independent timeout.
+
+    Uses a ThreadPoolExecutor to run the HTTP request in a separate thread
+    with a configurable timeout, ensuring a stalled provider cannot block
+    the Telegram request.
+    """
     payload = json.dumps({
         "model": settings.model,
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": settings.max_chars,
     }).encode()
-    request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
-                      headers={"Content-Type": "application/json"}, method="POST")
-    try:
+
+    def do_request():
+        request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(request, timeout=settings.timeout) as response:
             data = json.loads(response.read())
         text = data["choices"][0]["message"].get("content", "").strip()
         if not text:
             raise ValueError("empty model response")
         return text[: settings.max_chars]
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(do_request)
+    try:
+        return future.result(timeout=settings.timeout)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise ProviderTimeoutError("model request timed out") from exc
     except (HTTPError, URLError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError("model request failed") from exc
+    finally:
+        # Do not wait on a provider that has already exceeded the caller's
+        # deadline. The request itself has the same socket timeout and the
+        # future is cancelled when it has not started yet.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
@@ -144,6 +194,7 @@ def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
         return model_name, True
     except Exception:
         return "unreachable", False
+
 
 class State:
     def __init__(self, settings: Settings) -> None:
@@ -328,6 +379,7 @@ def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
         text = text[max_chunk:]
     return chunks
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
@@ -347,8 +399,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         async with state.request_gate:
             response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
+    except ProviderTimeoutError:
+        state.history[user_id].pop()
+        log_provider_failure("llama.cpp", "timeout")
+        logger.exception("llama.cpp request timed out for user %s", user_id)
+        await update.message.reply_text("The model request timed out. Please try again shortly.")
+        return
     except RuntimeError:
         state.history[user_id].pop()
+        log_provider_failure("llama.cpp", "request_failed")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
         return
