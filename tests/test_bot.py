@@ -12,7 +12,7 @@ import pytest
 from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, complete,
                                complete_with_usage, private, _chunk, log_provider_failure,
                                get_provider_failures, _provider_failures,
-                               _truncate_history_by_limit, _write_state_atomic, _read_state,
+                               _truncate_history_by_limit, _write_state_atomic,
                                handle_message)
 
 
@@ -356,7 +356,7 @@ def test_complete_independent_timeout():
         try:
             complete(settings, [{"role": "user", "content": "test"}])
             assert False, "Expected RuntimeError"
-        except RuntimeError as e:
+        except RuntimeError:
             elapsed = time.time() - start
             # Should have timed out, not waited for the full 10 seconds
             assert elapsed < 3, f"Request took {elapsed}s, expected timeout"
