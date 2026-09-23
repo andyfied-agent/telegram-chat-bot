@@ -196,7 +196,7 @@ The service unit telegram-chat-bot.service.example can be deployed as a user ser
 3. Enable and start:
    systemctl --user enable --now telegram-chat-bot
 
-The unit uses systemd StateDirectory to create the registration-state directory before startup and runs as a simple service with hardened settings (PrivateTmp, ProtectHome=read-only, ProtectSystem=strict) and restarts on failure after 5 seconds.
+The unit uses systemd StateDirectory to create the persistent state directory before startup. Both `TELEGRAM_REGISTRATION_FILE` and `TELEGRAM_CHAT_BOT_STATE_FILE` point into `%S/telegram-chat-bot`, which remains writable despite `ProtectHome=read-only` and `ProtectSystem=strict`. The service runs as a simple service and restarts on failure after 5 seconds.
 
 ## Development
 

@@ -1268,6 +1268,22 @@ def test_openrouter_account_limit_is_shared_across_users():
     assert usage.stats(100, "openrouter")["account_requests"] == 50
 
 
+def test_usage_stats_reports_effective_minimum_of_user_and_account_limits():
+    settings = Settings(
+        token="test",
+        openrouter_enabled=True,
+        default_daily_request_limit=10,
+        openrouter_daily_request_limit=50,
+    )
+    usage = UsageState(settings, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+
+    stats = usage.stats(100, "openrouter")
+
+    assert stats["limit"] == 10
+    assert stats["account_limit"] == 50
+    assert stats["remaining"] == 10
+
+
 def test_usage_state_records_tokens_and_persists_with_registration_state(tmp_path):
     state_file = tmp_path / "state.json"
     registration_file = tmp_path / "registrations.json"

@@ -396,11 +396,12 @@ class UsageState:
         if account_limit:
             remaining_values.append(max(0, account_limit - account_requests))
         remaining = min(remaining_values) if remaining_values else None
+        effective_limit = min(limits) if limits else 0
         return {
             "date": self.date_key(), "user_id": user_id, "provider": provider,
             "request_count": record.request_count, "prompt_tokens": record.prompt_tokens,
             "completion_tokens": record.completion_tokens, "total_tokens": record.total_tokens,
-            "limit": max(limits) if limits else 0, "remaining": remaining,
+            "limit": effective_limit, "remaining": remaining,
             "account_limit": account_limit, "account_requests": account_requests,
         }
 

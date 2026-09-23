@@ -16,6 +16,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 StateDirectory=telegram-chat-bot
 Environment=TELEGRAM_REGISTRATION_FILE=%S/telegram-chat-bot/registrations.json
+Environment=TELEGRAM_CHAT_BOT_STATE_FILE=%S/telegram-chat-bot/state.json
 ReadWritePaths=%h/opt/telegram-chat-bot
 
 [Install]
