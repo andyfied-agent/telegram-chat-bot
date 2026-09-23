@@ -7,11 +7,14 @@ import logging
 import os
 import sys
 import math
+import tempfile
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
-import tempfile
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -23,6 +26,35 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+@dataclass(frozen=True)
+class ProviderFailure:
+    """Record a provider failure without exposing credentials or URLs."""
+    provider: str
+    error_type: str
+    timestamp: float = field(default_factory=time.time)
+
+    def __str__(self) -> str:
+        return f"{self.provider} failed: {self.error_type} at {self.timestamp}"
+
+
+# Global failure log (in-memory, no credentials/URLs stored)
+_provider_failures: list[ProviderFailure] = []
+
+
+def log_provider_failure(provider: str, error_type: str) -> None:
+    """Log a provider failure without exposing credentials or request URLs."""
+    failure = ProviderFailure(provider=provider, error_type=error_type)
+    _provider_failures.append(failure)
+    logger.warning("%s", failure)
+
+
+def get_provider_failures() -> list[ProviderFailure]:
+    """Return the list of recorded provider failures."""
+    return _provider_failures[:]
+
+
+class ProviderTimeoutError(RuntimeError):
+    """Raised when the bounded provider request exceeds its timeout."""
 
 
 def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool = False) -> float:
@@ -45,6 +77,88 @@ def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool =
     return num
 
 
+def _validate_limit_setting(value: str, setting_name: str) -> int:
+    """Validate a daily limit, where zero means unlimited."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{setting_name} must be a non-negative integer, got {value!r}")
+    if limit < 0:
+        raise ValueError(f"{setting_name} must be non-negative, got {limit}")
+    return limit
+
+
+def _parse_bool_setting(value: str, setting_name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{setting_name} must be a boolean, got {value!r}")
+
+
+def _parse_provider_limits(value: str) -> dict[str, int]:
+    """Parse JSON provider limits without accepting malformed configuration."""
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("PROVIDER_DAILY_LIMITS must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("PROVIDER_DAILY_LIMITS must be a JSON object")
+    limits: dict[str, int] = {}
+    for provider, limit in parsed.items():
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("PROVIDER_DAILY_LIMITS provider names must be non-empty strings")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("PROVIDER_DAILY_LIMITS values must be non-negative integers")
+        limits[provider] = limit
+    return limits
+
+
+_state_lock = asyncio.Lock()
+
+
+def _write_state_atomic(state_file: str, data: dict) -> None:
+    """Write state atomically with restrictive permissions (0o600)."""
+    dir_path = Path(state_file).parent
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(dir_path), prefix=".state-", suffix=".tmp"
+    )
+    temp_file = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, state_file)
+    except Exception:
+        try:
+            temp_file.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _read_state(state_file: str) -> dict:
+    """Read state from file, returning empty dict if not found."""
+    try:
+        with open(state_file, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _truncate_history_by_limit(history: list[dict], max_history: int) -> list[dict]:
+    """Truncate history to max_history entries, keeping newest entries."""
+    if len(history) <= max_history:
+        return history
+    # Retain the most recent messages.
+    return history[-max_history:]
+
+
 @dataclass(frozen=True)
 class Settings:
     token: str
@@ -63,6 +177,13 @@ class Settings:
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
     ))
+    state_file: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_BOT_STATE_FILE", os.path.expanduser("~/.telegram-chat-bot/state.json")))
+    max_history: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("TELEGRAM_CHAT_BOT_MAX_HISTORY", "100"), "TELEGRAM_CHAT_BOT_MAX_HISTORY"))
+    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "llama.cpp"))
+    default_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("DEFAULT_DAILY_REQUEST_LIMIT", "0"), "DEFAULT_DAILY_REQUEST_LIMIT"))
+    provider_daily_limits: dict[str, int] = field(default_factory=lambda: _parse_provider_limits(os.getenv("PROVIDER_DAILY_LIMITS", "{}")))
+    openrouter_enabled: bool = field(default_factory=lambda: _parse_bool_setting(os.getenv("OPENROUTER_ENABLED", "false"), "OPENROUTER_ENABLED"))
+    openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
 
 
 class RegistrationStore:
@@ -103,24 +224,70 @@ class RegistrationStore:
             Path(temporary).unlink(missing_ok=True)
 
 
-def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+@dataclass(frozen=True)
+class CompletionResult:
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+def complete_with_usage(settings: Settings, messages: list[dict[str, str]]) -> CompletionResult:
+    """Make a model request with an independent timeout.
+
+    Uses a ThreadPoolExecutor to run the HTTP request in a separate thread
+    with a configurable timeout, ensuring a stalled provider cannot block
+    the Telegram request.
+    """
     payload = json.dumps({
         "model": settings.model,
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": settings.max_chars,
     }).encode()
-    request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
-                      headers={"Content-Type": "application/json"}, method="POST")
-    try:
+
+    def do_request():
+        request = Request(f"{settings.base_url.rstrip('/')}/chat/completions", data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(request, timeout=settings.timeout) as response:
             data = json.loads(response.read())
         text = data["choices"][0]["message"].get("content", "").strip()
         if not text:
             raise ValueError("empty model response")
-        return text[: settings.max_chars]
+        usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise ValueError("invalid token usage in model response")
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        if (isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int)
+                or prompt_tokens < 0 or isinstance(completion_tokens, bool)
+                or not isinstance(completion_tokens, int) or completion_tokens < 0):
+            raise ValueError("invalid token usage in model response")
+        return CompletionResult(text=text[: settings.max_chars], prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens)
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(do_request)
+    try:
+        return future.result(timeout=settings.timeout)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise ProviderTimeoutError("model request timed out") from exc
     except (HTTPError, URLError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
         raise RuntimeError("model request failed") from exc
+    finally:
+        # Do not wait on a provider that has already exceeded the caller's
+        # deadline. The request itself has the same socket timeout and the
+        # future is cancelled when it has not started yet.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
+    """Return only the response text for callers using the legacy API."""
+    return complete_with_usage(settings, messages).text
 
 
 def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
@@ -145,6 +312,140 @@ def health_check(base_url: str, timeout: float) -> tuple[str, bool]:
     except Exception:
         return "unreachable", False
 
+
+@dataclass
+class UsageRecord:
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+class UsageState:
+    """Durable per-user, per-provider daily request and token accounting."""
+
+    def __init__(self, settings: Settings, clock: Callable[[], float] = time.time) -> None:
+        self.settings = settings
+        self._clock = clock
+        self.records: dict[str, dict[str, UsageRecord]] = defaultdict(dict)
+        self.provider_requests: dict[str, dict[str, int]] = defaultdict(dict)
+
+    def date_key(self) -> str:
+        return datetime.fromtimestamp(self._clock()).date().isoformat()
+
+    @staticmethod
+    def _record_key(user_id: int, provider: str) -> str:
+        return f"{user_id}:{provider}"
+
+    def _get_record(self, user_id: int, provider: str, day: str | None = None) -> UsageRecord:
+        day = day or self.date_key()
+        key = self._record_key(user_id, provider)
+        return self.records.setdefault(day, {}).setdefault(key, UsageRecord())
+
+    def limit_for(self, provider: str) -> int:
+        if provider == "openrouter" and self.settings.openrouter_enabled:
+            return self.settings.default_daily_request_limit
+        if provider in self.settings.provider_daily_limits:
+            return self.settings.provider_daily_limits[provider]
+        return self.settings.default_daily_request_limit
+
+    def account_limit_for(self, provider: str) -> int:
+        if provider != "openrouter" or not self.settings.openrouter_enabled:
+            return 0
+        return self.settings.provider_daily_limits.get(provider, self.settings.openrouter_daily_request_limit)
+
+    def reserve_request(self, user_id: int, provider: str) -> tuple[bool, int, int]:
+        """Reserve one outbound request and return (allowed, limit, remaining)."""
+        record = self._get_record(user_id, provider)
+        user_limit = self.limit_for(provider)
+        account_limit = self.account_limit_for(provider)
+        account_count = self.provider_requests.setdefault(self.date_key(), {}).get(provider, 0)
+        if user_limit and record.request_count >= user_limit:
+            return False, user_limit, 0
+        if account_limit and account_count >= account_limit:
+            return False, account_limit, 0
+        record.request_count += 1
+        if account_limit:
+            self.provider_requests[self.date_key()][provider] = account_count + 1
+        user_remaining = max(0, user_limit - record.request_count) if user_limit else None
+        account_remaining = max(0, account_limit - account_count - 1) if account_limit else None
+        remaining = min(value for value in (user_remaining, account_remaining) if value is not None) if (user_remaining is not None or account_remaining is not None) else 0
+        return True, account_limit or user_limit, remaining
+
+    def record_tokens(self, user_id: int, provider: str, prompt_tokens: int, completion_tokens: int) -> None:
+        if (isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0
+                or isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int)
+                or completion_tokens < 0):
+            raise ValueError("token counts must be non-negative integers")
+        record = self._get_record(user_id, provider)
+        record.prompt_tokens += prompt_tokens
+        record.completion_tokens += completion_tokens
+
+    def stats(self, user_id: int, provider: str) -> dict[str, int | str | None]:
+        record = self._get_record(user_id, provider)
+        user_limit = self.limit_for(provider)
+        account_limit = self.account_limit_for(provider)
+        account_requests = self.provider_requests.get(self.date_key(), {}).get(provider, 0)
+        limits = [value for value in (user_limit, account_limit) if value]
+        remaining_values = []
+        if user_limit:
+            remaining_values.append(max(0, user_limit - record.request_count))
+        if account_limit:
+            remaining_values.append(max(0, account_limit - account_requests))
+        remaining = min(remaining_values) if remaining_values else None
+        effective_limit = min(limits) if limits else 0
+        return {
+            "date": self.date_key(), "user_id": user_id, "provider": provider,
+            "request_count": record.request_count, "prompt_tokens": record.prompt_tokens,
+            "completion_tokens": record.completion_tokens, "total_tokens": record.total_tokens,
+            "limit": effective_limit, "remaining": remaining,
+            "account_limit": account_limit, "account_requests": account_requests,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "records": {
+                day: {
+                key: {"request_count": record.request_count,
+                      "prompt_tokens": record.prompt_tokens,
+                      "completion_tokens": record.completion_tokens}
+                for key, record in records.items()
+                }
+            for day, records in self.records.items()
+            },
+            "provider_requests": {
+                day: dict(providers) for day, providers in self.provider_requests.items()
+            },
+        }
+
+    def load_dict(self, data: object) -> None:
+        if not isinstance(data, dict):
+            return
+        raw_records = data.get("records", data) if isinstance(data, dict) else {}
+        raw_provider_requests = data.get("provider_requests", {}) if isinstance(data, dict) else {}
+        for day, providers in raw_provider_requests.items():
+            if not isinstance(day, str) or not isinstance(providers, dict):
+                continue
+            for provider, count in providers.items():
+                if isinstance(provider, str) and isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                    self.provider_requests[day][provider] = count
+        for day, day_data in raw_records.items():
+            if not isinstance(day, str) or not isinstance(day_data, dict):
+                continue
+            for key, raw_record in day_data.items():
+                if not isinstance(key, str) or not isinstance(raw_record, dict):
+                    continue
+                counts = {name: raw_record.get(name, 0)
+                          for name in ("request_count", "prompt_tokens", "completion_tokens")}
+                if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                       for value in counts.values()):
+                    continue
+                self.records[day][key] = UsageRecord(**counts)
+
+
 class State:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -156,6 +457,47 @@ class State:
         self.last_request: dict[int, float] = {}
         self.request_gate = asyncio.Semaphore(1)
         self.registrations = RegistrationStore(settings.registration_file)
+        self.usage = UsageState(settings)
+        self._persisted = False
+
+    def _load(self) -> None:
+        """Load state from file on disk."""
+        if self._persisted:
+            return
+        data = _read_state(self.settings.state_file)
+        self.global_prompt = data.get("global_prompt", "")
+        self.private_prompts = {int(k): v for k, v in data.get("private_prompts", {}).items()}
+        user_history = data.get("user_history", {})
+        for user_id_str, msgs in user_history.items():
+            user_id = int(user_id_str)
+            # Truncate to max_history limit if exceeded
+            truncated = _truncate_history_by_limit(msgs, self.settings.max_history)
+            self.history[user_id] = deque(truncated, maxlen=self.settings.max_messages)
+        self.last_request = {int(k): v for k, v in data.get("last_request", {}).items()}
+        self.usage.load_dict(data.get("usage", {}))
+        self._persisted = True
+
+    def _dump(self) -> None:
+        """Dump state to file atomically with restrictive permissions."""
+        data = {
+            "global_prompt": self.global_prompt,
+            "private_prompts": self.private_prompts,
+            "user_history": {str(uid): list(msgs) for uid, msgs in self.history.items()},
+            "last_request": self.last_request,
+            "usage": self.usage.to_dict(),
+        }
+        _write_state_atomic(self.settings.state_file, data)
+
+    async def persist(self) -> None:
+        """Persist state to disk atomically."""
+        async with _state_lock:
+            self._dump()
+
+    async def reset(self, user_id: int) -> None:
+        """Reset user state: clear history and last_request."""
+        self.history.pop(user_id, None)
+        self.last_request.pop(user_id, None)
+        await self.persist()
 
     def allowed(self, user_id: int) -> bool:
         return user_id in self.settings.allowed_user_ids or self.registrations.status(user_id) == "approved"
@@ -269,7 +611,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     if not state.allowed(update.effective_user.id):
         return
-    state.history.pop(update.effective_user.id, None)
+    await state.reset(update.effective_user.id)
     await update.message.reply_text("Your conversation context has been reset.")
 
 
@@ -291,6 +633,7 @@ async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Usage: /addglobalprompt <prompt>")
         return
     state.global_prompt = prompt[: state.settings.max_chars]
+    await state.persist()
     await update.message.reply_text("Global prompt updated.")
 
 
@@ -303,6 +646,7 @@ async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Usage: /addprivateprompt <prompt>")
         return
     state.private_prompts[update.effective_user.id] = prompt[: state.settings.max_chars]
+    await state.persist()
     await update.message.reply_text("Private prompt updated.")
 
 
@@ -315,7 +659,23 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /usage /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+
+
+async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.allowed(user_id):
+        return
+    stats = state.usage.stats(user_id, state.settings.provider)
+    remaining = "unlimited" if stats["remaining"] is None else str(stats["remaining"])
+    await update.message.reply_text(
+        f"Usage for {stats['date']} ({stats['provider']}):\n"
+        f"Requests: {stats['request_count']}/{stats['limit'] or 'unlimited'}\n"
+        f"Remaining: {remaining}\n"
+        f"Tokens: {stats['total_tokens']} ({stats['prompt_tokens']} prompt, "
+        f"{stats['completion_tokens']} completion)"
+    )
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
@@ -327,6 +687,7 @@ def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
         chunks.append(text[:max_chunk])
         text = text[max_chunk:]
     return chunks
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
@@ -342,18 +703,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
         await update.message.reply_text("Please wait a moment before sending another message.")
         return
+    provider = state.settings.provider
+    allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
+    if not allowed:
+        await update.message.reply_text(
+            f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
+        )
+        return
     state.last_request[user_id] = now
     state.history[user_id].append({"role": "user", "content": text})
+    await state.persist()
     try:
         async with state.request_gate:
-            response = await asyncio.to_thread(complete, state.settings, state.messages(user_id))
+            result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id))
+    except ProviderTimeoutError:
+        state.history[user_id].pop()
+        log_provider_failure(provider, "timeout")
+        logger.exception("llama.cpp request timed out for user %s", user_id)
+        await state.persist()
+        await update.message.reply_text("The model request timed out. Please try again shortly.")
+        return
     except RuntimeError:
         state.history[user_id].pop()
+        log_provider_failure(provider, "request_failed")
         logger.exception("llama.cpp request failed for user %s", user_id)
+        await state.persist()
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
         return
-    state.history[user_id].append({"role": "assistant", "content": response})
-    chunks = _chunk(response)
+    state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
+    state.history[user_id].append({"role": "assistant", "content": result.text})
+    await state.persist()
+    chunks = _chunk(result.text)
     for chunk in chunks:
         await update.message.reply_text(chunk)
 
@@ -366,11 +746,13 @@ def main() -> None:
     settings = Settings(token=token)
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
+    # Load persisted state on startup
+    app.bot_data["state"]._load()
     only_private = private()
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
-                "shutdown": shutdown, "help": help_command}
+                "shutdown": shutdown, "help": help_command, "usage": usage}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))

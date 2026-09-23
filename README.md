@@ -133,11 +133,28 @@ The bot registers the following handlers:
 - /status -> status -- Model + history window
 - /reset -> reset -- Clear conversation history
 - /history -> history -- Report memory size
+- /usage -> usage -- Report today's request and token usage
 - /addglobalprompt -> addglobalprompt -- Set global system prompt
 - /addprivateprompt -> addprivateprompt -- Set per-user private prompt
 - /shutdown -> shutdown -- Refused remotely
 - /help -> help_command -- List commands
 - text (non-command) -> handle_message -- Chat completion via llama.cpp
+
+## Usage accounting and quotas
+
+The bot stores daily request and token counters in the same atomically-written
+state file as conversation state. Counters are keyed by Telegram user and
+provider. An outbound request consumes one request quota even when the provider
+fails; prompt and completion token counters are updated from successful
+provider responses that include usage data. A limit of `0` means unlimited.
+
+Set `DEFAULT_DAILY_REQUEST_LIMIT` for the default provider and use the JSON
+`PROVIDER_DAILY_LIMITS` map for provider-specific overrides. If
+`OPENROUTER_ENABLED=true`, OpenRouter defaults to its documented 50-request
+daily account limit, configurable with `OPENROUTER_DAILY_REQUEST_LIMIT`.
+OpenRouter's account counter is shared across Telegram users while the
+per-user counters remain available for reporting. The `/usage` command reports
+the current provider's counters for the requesting user.
 
 ## Chunking
 
@@ -179,7 +196,7 @@ The service unit telegram-chat-bot.service.example can be deployed as a user ser
 3. Enable and start:
    systemctl --user enable --now telegram-chat-bot
 
-The unit uses systemd StateDirectory to create the registration-state directory before startup and runs as a simple service with hardened settings (PrivateTmp, ProtectHome=read-only, ProtectSystem=strict) and restarts on failure after 5 seconds.
+The unit uses systemd StateDirectory to create the persistent state directory before startup. Both `TELEGRAM_REGISTRATION_FILE` and `TELEGRAM_CHAT_BOT_STATE_FILE` point into `%S/telegram-chat-bot`, which remains writable despite `ProtectHome=read-only` and `ProtectSystem=strict`. The service runs as a simple service and restarts on failure after 5 seconds.
 
 ## Development
 

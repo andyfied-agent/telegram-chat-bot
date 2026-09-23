@@ -1,11 +1,19 @@
+import asyncio
 import json
+import os
+import tempfile
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import State, Settings, complete, handle_message, private, _chunk
+from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, complete,
+                               complete_with_usage, private, _chunk, log_provider_failure,
+                               get_provider_failures, _provider_failures,
+                               _truncate_history_by_limit, _write_state_atomic,
+                               handle_message)
 
 
 def test_private_filter():
@@ -289,10 +297,75 @@ def test_chunk_single_chunk_preserved():
     assert chunks == [text]
 
 
+# ---- Provider resilience tests ----
+
+
+def test_log_provider_failure():
+    """Test that provider failures are logged without exposing URLs or credentials."""
+    # Clear any existing failures
+    _provider_failures.clear()
+
+    log_provider_failure("llama.cpp", "timeout")
+    failures = get_provider_failures()
+
+    assert len(failures) == 1
+    assert failures[0].provider == "llama.cpp"
+    assert failures[0].error_type == "timeout"
+    # Should not contain any URL or credential information
+    assert "http" not in str(failures[0])
+    assert "token" not in str(failures[0]).lower()
+
+
+def test_get_provider_failures_isolation():
+    """Test that get_provider_failures returns a copy, not the original list."""
+    _provider_failures.clear()
+    log_provider_failure("test", "error1")
+
+    failures1 = get_provider_failures()
+    failures2 = get_provider_failures()
+
+    assert failures1 is not failures2
+    assert failures1 == failures2
+
+
+def test_complete_independent_timeout():
+    """Test that complete() has an independent timeout mechanism.
+
+    The implementation uses ThreadPoolExecutor with a timeout parameter
+    to ensure a stalled provider cannot block the request indefinitely.
+    """
+    import time
+    from unittest.mock import patch, MagicMock
+
+    # Create a settings object with a very short timeout
+    settings = Settings(token="test", timeout=0.1)
+
+    mock_response = MagicMock()
+
+    def slow_request():
+        time.sleep(10)  # Simulate a very slow/stalled request
+        return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    mock_response.read.side_effect = slow_request
+
+    with patch('telegram_chat_bot.urlopen') as mock_urlopen:
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        # The request should timeout, not hang
+        start = time.time()
+        try:
+            complete(settings, [{"role": "user", "content": "test"}])
+            assert False, "Expected RuntimeError"
+        except RuntimeError:
+            elapsed = time.time() - start
+            # Should have timed out, not waited for the full 10 seconds
+            assert elapsed < 3, f"Request took {elapsed}s, expected timeout"
+
+
 @pytest.mark.asyncio
 async def test_handle_message_rejects_unallowlisted_user():
     """handle_message must return early without any reply when user is not allowlisted."""
-    from telegram_chat_bot import handle_message
+    from telegram_chat_bot import handle_message, State
 
     # No env set → allowed_user_ids is empty → everyone rejected
     settings = Settings(token='test_token')
@@ -316,7 +389,7 @@ async def test_handle_message_rejects_unallowlisted_user():
 @pytest.mark.asyncio
 async def test_handle_message_ignores_non_private_chat():
     """handle_message must ignore group/supergroup/channel messages entirely."""
-    from telegram_chat_bot import handle_message
+    from telegram_chat_bot import handle_message, State
 
     settings = Settings(token='test_token')
     state = State(settings)
@@ -340,8 +413,6 @@ async def test_handle_message_ignores_non_private_chat():
 async def test_handle_message_rate_limiting():
     """A second request within the interval gets the wait reply and does NOT call
     the model or add history."""
-    from telegram_chat_bot import Settings, State
-
     settings = Settings(token='test', allowed_user_ids=frozenset({123}), request_interval=5.0)
     state = State(settings)
     state.last_request[123] = time.monotonic()
@@ -367,8 +438,6 @@ async def test_handle_message_rate_limiting():
 async def test_handle_message_model_failure_rollback():
     """When the model raises, the user message is removed from history and an
     error reply is sent."""
-    from telegram_chat_bot import Settings, State
-
     settings = Settings(token='test', allowed_user_ids=frozenset({123}))
     state = State(settings)
     state.last_request[123] = 0
@@ -382,11 +451,11 @@ async def test_handle_message_model_failure_rollback():
     mock_context = MagicMock()
     mock_context.application.bot_data = {"state": state}
 
-    with patch("telegram_chat_bot.complete", side_effect=RuntimeError("model request failed")):
+    with patch("telegram_chat_bot.complete_with_usage", side_effect=RuntimeError("model request failed")):
         await handle_message(mock_update, mock_context)
 
     mock_update.message.reply_text.assert_called_once_with(
-        "I couldn\'t reach the local model. Please try again shortly."
+        "I couldn't reach the local model. Please try again shortly."
     )
     assert len(state.history[123]) == 0
 
@@ -650,7 +719,7 @@ def test_validate_numeric_setting_inf_raises():
 
 def test_validate_numeric_setting_negative_inf_raises():
     """-inf must be rejected with a descriptive ValueError.
-    
+
     -inf is <= 0 so gets caught by the positive check first.
     """
     from telegram_chat_bot import _validate_numeric_setting
@@ -670,7 +739,7 @@ def test_validate_numeric_setting_infinity_raises():
 
 def test_validate_numeric_setting_negative_infinity_raises():
     """'-Infinity' must be rejected.
-    
+
     Like -inf, -Infinity <= 0 so the positive check catches it.
     """
     from telegram_chat_bot import _validate_numeric_setting
@@ -682,7 +751,7 @@ def test_validate_numeric_setting_negative_infinity_raises():
 
 def test_settings_invalid_nan_timeout_raises():
     """LLAMA_CPP_TIMEOUT=nan must raise ValueError at Settings init.
-    
+
     LLAMA_CPP_TIMEOUT is validated as int, so "nan" is caught by the
     non-numeric path (int("nan") raises ValueError).
     """
@@ -702,7 +771,6 @@ def test_settings_invalid_inf_interval_raises():
         assert "finite positive value" in str(exc.value)
 
 
-
 def test_settings_invalid_nan_interval_raises():
     """MODEL_REQUEST_INTERVAL=nan must raise ValueError (as_float=True path)."""
     with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "nan"}):
@@ -714,7 +782,7 @@ def test_settings_invalid_nan_interval_raises():
 
 def test_settings_invalid_negative_inf_interval_raises():
     """MODEL_REQUEST_INTERVAL=-inf must raise ValueError (as_float=True path).
-    
+
     -inf is <= 0, so the "must be positive" check catches it.
     """
     with patch.dict("os.environ", {"MODEL_REQUEST_INTERVAL": "-inf"}):
@@ -893,3 +961,354 @@ async def test_start_parameter_is_rejected_without_registration(tmp_path):
     update.message.reply_text.assert_awaited_once_with(
         "This bot does not support /start parameters. Send /start without additional text to request access."
     )
+# --- Persistent state tests ---
+
+
+class TestPersistentState:
+    """Tests for issue #11: persistent conversation state."""
+
+    def test_settings_state_file_default(self):
+        """Default state_file points to ~/.telegram-chat-bot/state.json."""
+        with patch("os.path.expanduser", return_value="/home/test/.telegram-chat-bot/state.json"):
+            settings = Settings(token='test')
+        assert settings.state_file == "/home/test/.telegram-chat-bot/state.json"
+
+    def test_settings_custom_state_file(self):
+        """Custom state_file can be set via environment variable."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_STATE_FILE': '/custom/path/state.json'}):
+            settings = Settings(token='test')
+        assert settings.state_file == '/custom/path/state.json'
+
+    def test_settings_max_history_default(self):
+        """Default max_history is 100."""
+        settings = Settings(token='test')
+        assert settings.max_history == 100
+
+    def test_settings_custom_max_history(self):
+        """Custom max_history can be set via environment variable."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': '50'}):
+            settings = Settings(token='test')
+        assert settings.max_history == 50
+
+    def test_settings_invalid_max_history_raises(self):
+        """Invalid max_history must raise ValueError."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': 'abc'}):
+            with pytest.raises(ValueError) as exc:
+                Settings(token='test')
+        assert "TELEGRAM_CHAT_BOT_MAX_HISTORY" in str(exc.value)
+
+    def test_settings_zero_max_history_raises(self):
+        """Zero max_history must raise ValueError."""
+        with patch.dict('os.environ', {'TELEGRAM_CHAT_BOT_MAX_HISTORY': '0'}):
+            with pytest.raises(ValueError) as exc:
+                Settings(token='test')
+        assert "must be positive" in str(exc.value)
+
+    def test_truncate_history_within_limit(self):
+        """History within limit is unchanged."""
+        history = [{'role': 'user', 'content': 'msg1'}, {'role': 'assistant', 'content': 'msg2'}]
+        result = _truncate_history_by_limit(history, 100)
+        assert result == history
+
+    def test_truncate_history_at_limit(self):
+        """History at limit is unchanged."""
+        history = [{'role': 'user', 'content': f'msg{i}'} for i in range(10)]
+        result = _truncate_history_by_limit(history, 10)
+        assert result == history
+
+    def test_truncate_history_over_limit(self):
+        """History over limit is truncated, keeping oldest entries."""
+        history = [{'role': 'user', 'content': f'msg{i}'} for i in range(20)]
+        result = _truncate_history_by_limit(history, 10)
+        assert len(result) == 10
+        # Slice from back gives us msgs 10-19
+        for i in range(10):
+            assert result[i]['content'] == f'msg{10 + i}'
+
+    @pytest.mark.asyncio
+    async def test_state_load_nonexistent_file(self):
+        """State load from nonexistent file returns empty state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            f.write(b'')
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == ''
+            assert state.private_prompts == {}
+            assert state.history == {}
+            assert state.last_request == {}
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_invalid_json(self):
+        """State load from invalid JSON returns empty state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            f.write('not valid json')
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == ''
+            assert state.private_prompts == {}
+            assert state.history == {}
+            assert state.last_request == {}
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_valid_json(self):
+        """State load from valid JSON restores state."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            json.dump({
+                "global_prompt": "Test global",
+                "private_prompts": {"123": "Private for 123", "456": "Private for 456"},
+                "user_history": {"123": [{"role": "user", "content": "Hi"}]},
+                "last_request": {"123": 12345.0}
+            }, f)
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state._load()
+            assert state.global_prompt == "Test global"
+            assert state.private_prompts[123] == "Private for 123"
+            assert state.private_prompts[456] == "Private for 456"
+            assert len(state.history[123]) == 1
+            assert state.history[123][0]['content'] == "Hi"
+            assert state.last_request[123] == 12345.0
+        finally:
+            os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_load_truncates_history(self):
+        """State load truncates history to max_history limit, keeping oldest entries."""
+        history = [{"role": "user", "content": f"msg{i}"} for i in range(200)]
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False, mode='w') as f:
+            json.dump({
+                "user_history": {"123": history}
+            }, f)
+            temp_path = f.name
+        try:
+            settings = Settings(token='test', state_file=temp_path, max_history=50)
+            state = State(settings)
+            state._load()
+            # deque(maxlen=20) means it keeps latest 20 from the truncated list
+            assert len(state.history[123]) == 20
+            # Should have kept oldest 50 from 200, then deque keeps newest 20 of those
+            # Oldest 50 from 200 are msgs 150-199
+            # Newest 20 of those are msgs 180-199
+            assert state.history[123][0]['content'] == "msg180"
+            assert state.history[123][19]['content'] == "msg199"
+        finally:
+            os.unlink(temp_path)
+
+    def test_write_state_atomic_creates_dir(self):
+        """_write_state_atomic creates parent directories."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = os.path.join(tmpdir, "subdir", "state.json")
+            _write_state_atomic(state_file, {"test": "value"})
+            assert os.path.exists(state_file)
+
+    def test_write_state_atomic_sets_permissions(self):
+        """_write_state_atomic sets restrictive permissions (0o600)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            _write_state_atomic(temp_path, {"test": "value"})
+            mode = os.stat(temp_path).st_mode & 0o777
+            assert mode == 0o600
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def test_write_state_atomic_atomic(self):
+        """_write_state_atomic uses atomic rename."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            _write_state_atomic(temp_path, {"step1": True})
+            # Read and verify
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data == {"step1": True}
+            # Write again
+            _write_state_atomic(temp_path, {"step2": True})
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data == {"step2": True}
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_persist(self):
+        """State persist writes state to file."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state.global_prompt = "Test prompt"
+            state.private_prompts[123] = "Private"
+            state.history[123].append({"role": "user", "content": "Hi"})
+            await state.persist()
+            # Verify file was written
+            assert os.path.exists(temp_path)
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert data["global_prompt"] == "Test prompt"
+            assert data["private_prompts"]["123"] == "Private"
+            assert len(data["user_history"]["123"]) == 1
+            # Verify permissions
+            mode = os.stat(temp_path).st_mode & 0o777
+            assert mode == 0o600
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    @pytest.mark.asyncio
+    async def test_state_reset(self):
+        """State reset clears user history and last_request, and persists."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            temp_path = f.name
+        try:
+            os.unlink(temp_path)
+            settings = Settings(token='test', state_file=temp_path)
+            state = State(settings)
+            state.history[123].append({"role": "user", "content": "Hi"})
+            state.last_request[123] = 12345.0
+            await state.persist()
+            # Verify persisted
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert "123" in data["user_history"]
+            assert "123" in data["last_request"]
+            # Now reset
+            await state.reset(123)
+            # Verify cleared
+            assert 123 not in state.history
+            assert 123 not in state.last_request
+            # Verify persisted
+            with open(temp_path, 'r') as f:
+                data = json.load(f)
+            assert "123" not in data["user_history"]
+            assert "123" not in data["last_request"]
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+# ---- Numeric setting validation tests for new settings ----
+
+
+def test_settings_invalid_state_file_max_history_raises():
+    """Invalid TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': 'abc',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "TELEGRAM_CHAT_BOT_MAX_HISTORY" in str(exc.value)
+
+
+def test_settings_zero_state_file_max_history_raises():
+    """Zero TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '0',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "must be positive" in str(exc.value)
+
+
+def test_settings_valid_max_history():
+    """Valid TELEGRAM_CHAT_BOT_MAX_HISTORY is accepted."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '200',
+    }):
+        settings = Settings(token='test_token')
+    assert settings.max_history == 200
+
+
+def test_settings_negative_max_history_raises():
+    """Negative TELEGRAM_CHAT_BOT_MAX_HISTORY must raise ValueError."""
+    with patch.dict('os.environ', {
+        'TELEGRAM_CHAT_BOT_MAX_HISTORY': '-5',
+    }):
+        with pytest.raises(ValueError) as exc:
+            Settings(token='test_token')
+        assert "must be positive" in str(exc.value)
+
+
+def test_openrouter_account_limit_is_shared_across_users():
+    settings = Settings(token="test", openrouter_enabled=True, default_daily_request_limit=0)
+    usage = UsageState(settings, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+
+    for request_number in range(49):
+        assert usage.reserve_request(100 if request_number % 2 else 200, "openrouter")[0] is True
+
+    assert usage.reserve_request(100, "openrouter")[0] is True
+    allowed, limit, remaining = usage.reserve_request(200, "openrouter")
+    assert (allowed, limit, remaining) == (False, 50, 0)
+    assert usage.stats(100, "openrouter")["account_requests"] == 50
+
+
+def test_usage_stats_reports_effective_minimum_of_user_and_account_limits():
+    settings = Settings(
+        token="test",
+        openrouter_enabled=True,
+        default_daily_request_limit=10,
+        openrouter_daily_request_limit=50,
+    )
+    usage = UsageState(settings, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+
+    stats = usage.stats(100, "openrouter")
+
+    assert stats["limit"] == 10
+    assert stats["account_limit"] == 50
+    assert stats["remaining"] == 10
+
+
+def test_usage_state_records_tokens_and_persists_with_registration_state(tmp_path):
+    state_file = tmp_path / "state.json"
+    registration_file = tmp_path / "registrations.json"
+    settings = Settings(token="test", state_file=str(state_file), registration_file=str(registration_file))
+    state = State(settings)
+    state.usage.reserve_request(123, "llama.cpp")
+    state.usage.record_tokens(123, "llama.cpp", 12, 34)
+    asyncio.run(state.persist())
+
+    restored = State(settings)
+    restored._load()
+    stats = restored.usage.stats(123, "llama.cpp")
+    assert stats["request_count"] == 1
+    assert stats["total_tokens"] == 46
+
+
+@patch("telegram_chat_bot.urlopen")
+def test_complete_with_usage_reads_provider_token_counts(mock_urlopen):
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps({
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 5},
+    }).encode()
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    result = complete_with_usage(Settings(token="test"), [{"role": "user", "content": "hi"}])
+    assert result == CompletionResult("ok", 7, 5)
+    assert result.total_tokens == 12
