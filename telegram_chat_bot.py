@@ -485,7 +485,7 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
                 circuit_breaker.record_failure()
                 log_provider_failure(provider, type(exc).__name__)
                 last_exception = exc
-            except HTTPClientError as exc:
+            except HTTPClientError:
                 # Already recorded, re-raise as-is
                 raise
             except Exception as exc:
