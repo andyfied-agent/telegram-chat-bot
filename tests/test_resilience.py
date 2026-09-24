@@ -144,6 +144,7 @@ from telegram_chat_bot import (
     _provider_circuit_breakers,
     complete_with_usage,
     ProviderTimeoutError,
+    HTTPClientError,
 )
 
 
@@ -268,3 +269,128 @@ def test_complete_with_usage_max_retries_exceeded():
         assert "failed after 3 retries" in str(exc_info.value)
     
     assert call_count == 4  # 1 initial + 3 retries
+
+
+"""Test HTTP retry policy."""
+from unittest.mock import MagicMock, patch
+import pytest
+from urllib.error import HTTPError
+
+from telegram_chat_bot import (
+    Settings,
+    _provider_circuit_breakers,
+    complete_with_usage,
+    ProviderTimeoutError,
+    HTTPClientError,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_circuit_breakers():
+    _provider_circuit_breakers.clear()
+    yield
+    _provider_circuit_breakers.clear()
+
+
+def test_http_400_not_retryable():
+    """400 Bad Request should NOT be retried."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        http_error = HTTPError("http://test", 400, "Bad Request", {}, None)
+        raise http_error
+    
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(HTTPClientError) as exc_info:
+            complete_with_usage(settings, messages)
+    
+    # Should fail immediately, not retry
+    assert call_count == 1
+    assert "HTTP 400" in str(exc_info.value)
+
+
+def test_http_401_not_retryable():
+    """401 Unauthorized should NOT be retried."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        http_error = HTTPError("http://test", 401, "Unauthorized", {}, None)
+        raise http_error
+    
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(HTTPClientError) as exc_info:
+            complete_with_usage(settings, messages)
+    
+    assert call_count == 1
+    assert "HTTP 401" in str(exc_info.value)
+
+
+def test_http_500_retryable():
+    """500 Internal Server Error SHOULD be retried."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            http_error = HTTPError("http://test", 500, "Internal Server Error", {}, None)
+            raise http_error
+        # Second call succeeds
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "response"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+    
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        result = complete_with_usage(settings, messages)
+    
+    # Should retry once and succeed
+    assert call_count == 2
+    assert result.text == "response"
+
+
+def test_http_503_retryable():
+    """503 Service Unavailable SHOULD be retried."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            http_error = HTTPError("http://test", 503, "Service Unavailable", {}, None)
+            raise http_error
+        # Second call succeeds
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "response"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+    
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        result = complete_with_usage(settings, messages)
+    
+    assert call_count == 2
+    assert result.text == "response"

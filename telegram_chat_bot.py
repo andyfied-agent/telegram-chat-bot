@@ -61,6 +61,11 @@ def _ensure_logging_initialized() -> None:
         _init_logging()
 
 
+class HTTPClientError(Exception):
+    """Non-retryable HTTP client errors (4xx)."""
+    pass
+
+
 @dataclass(frozen=True)
 class ProviderFailure:
     """Record a provider failure without exposing credentials or URLs."""
@@ -107,6 +112,11 @@ class CircuitBreaker:
     success_threshold: int = 2
     cooldown_seconds: float = 60.0
     half_open_max_requests: int = 2
+
+    def __post_init__(self):
+        # Ensure half_open_max_requests equals success_threshold for proper recovery
+        if self.half_open_max_requests != self.success_threshold:
+            object.__setattr__(self, 'half_open_max_requests', self.success_threshold)
 
     _state: CircuitState = CircuitState.CLOSED
     _failure_count: int = 0
@@ -180,7 +190,7 @@ class RetryConfig:
 _provider_circuit_breakers: dict[str, "CircuitBreaker"] = {}
 
 
-def get_circuit_breaker(provider: str, settings: Settings | None = None) -> "CircuitBreaker":
+def get_circuit_breaker(provider: str, settings: "Settings | None" = None) -> "CircuitBreaker":
     if provider not in _provider_circuit_breakers:
         if settings:
             _provider_circuit_breakers[provider] = CircuitBreaker(
@@ -395,12 +405,19 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
     """
     provider = provider or settings.provider
     circuit_breaker = get_circuit_breaker(provider, settings)
+    # Define transient HTTP statuses that warrant retry (5xx only, not 4xx)
+    transient_http_statuses = {500, 502, 503, 504}
+    
+    def should_retry_http_error(exc: HTTPError) -> bool:
+        return exc.code in transient_http_statuses
+    
     retry_config = RetryConfig(
         max_retries=settings.max_retries,
         base_delay=settings.retry_base_delay,
         max_delay=settings.retry_max_delay,
         jitter=True,
-        retryable_errors=(ProviderTimeoutError, RuntimeError, URLError, HTTPError),
+        retryable_errors=(ProviderTimeoutError, RuntimeError, URLError),
+        # HTTPError handling is special-cased below
     )
     
     payload = json.dumps({
@@ -452,11 +469,25 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
                 log_provider_failure(provider, "timeout")
                 future.cancel()
                 raise ProviderTimeoutError("model request timed out") from exc
+            except HTTPError as exc:
+                # Only retry transient HTTP errors (5xx), not client errors (4xx)
+                if should_retry_http_error(exc):
+                    circuit_breaker.record_failure()
+                    log_provider_failure(provider, f"HTTP {exc.code}")
+                    last_exception = exc
+                else:
+                    # Non-retryable: record failure and raise a special exception
+                    circuit_breaker.record_failure()
+                    log_provider_failure(provider, f"HTTP {exc.code}")
+                    raise HTTPClientError(f"HTTP {exc.code}: {exc.reason}") from exc
             except retry_config.retryable_errors as exc:
                 # Retryable error: record failure
                 circuit_breaker.record_failure()
                 log_provider_failure(provider, type(exc).__name__)
                 last_exception = exc
+            except HTTPClientError as exc:
+                # Already recorded, re-raise as-is
+                raise
             except Exception as exc:
                 # Non-retryable error: record failure, raise immediately
                 circuit_breaker.record_failure()
