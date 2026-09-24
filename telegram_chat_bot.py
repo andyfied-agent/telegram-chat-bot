@@ -4,15 +4,16 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
-import math
 import tempfile
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -24,6 +25,38 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Rotating file handler for Hermes logs (initialized lazily)
+_log_dir: Path | None = None
+_file_handler: RotatingFileHandler | None = None
+
+
+def _init_logging() -> None:
+    """Initialize rotating file handler lazily (only when first called)."""
+    global _log_dir, _file_handler
+    if _file_handler is not None:
+        return  # Already initialized
+    
+    _log_dir = Path("/mnt/scratch/hermes/logs")
+    try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = _log_dir / "telegram-chat-bot.log"
+        _file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10MB per file
+            backupCount=5,  # Keep 5 backup files
+            encoding="utf-8"
+        )
+        _file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        logger.addHandler(_file_handler)
+    except OSError as e:
+        logger.warning("Failed to initialize rotating file handler: %s (logging to stdout only)", e)
+
+
+def _ensure_logging_initialized() -> None:
+    """Ensure logging is initialized before use."""
+    if _file_handler is None:
+        _init_logging()
 
 
 @dataclass(frozen=True)
@@ -43,6 +76,7 @@ _provider_failures: list[ProviderFailure] = []
 
 def log_provider_failure(provider: str, error_type: str) -> None:
     """Log a provider failure without exposing credentials or request URLs."""
+    _ensure_logging_initialized()
     failure = ProviderFailure(provider=provider, error_type=error_type)
     _provider_failures.append(failure)
     logger.warning("%s", failure)
@@ -184,6 +218,7 @@ class Settings:
     provider_daily_limits: dict[str, int] = field(default_factory=lambda: _parse_provider_limits(os.getenv("PROVIDER_DAILY_LIMITS", "{}")))
     openrouter_enabled: bool = field(default_factory=lambda: _parse_bool_setting(os.getenv("OPENROUTER_ENABLED", "false"), "OPENROUTER_ENABLED"))
     openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
+    max_concurrent_requests: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_CONCURRENT_REQUESTS", "2"), "MAX_CONCURRENT_REQUESTS", as_float=False))
 
 
 class RegistrationStore:
@@ -455,10 +490,20 @@ class State:
         self.global_prompt = ""
         self.private_prompts: dict[int, str] = {}
         self.last_request: dict[int, float] = {}
-        self.request_gate = asyncio.Semaphore(1)
+        self.request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
         self.registrations = RegistrationStore(settings.registration_file)
         self.usage = UsageState(settings)
         self._persisted = False
+        
+        # Metrics tracking
+        self.total_requests: int = 0
+        self.successful_requests: int = 0
+        self.failed_requests: int = 0
+        self.total_response_time: float = 0.0
+        self.user_request_count: dict[int, int] = defaultdict(int)
+        
+        # Rate-limit tracking: timestamps of requests in the last minute per user
+        self.user_requests_minute: dict[int, deque[float]] = defaultdict(deque)
 
     def _load(self) -> None:
         """Load state from file on disk."""
@@ -607,6 +652,75 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
+    
+    total = state.total_requests
+    success = state.successful_requests
+    failed = state.failed_requests
+    avg_response_time = state.total_response_time / success if success > 0 else 0.0
+    success_rate = (success / total * 100) if total > 0 else 0.0
+    
+    lines = [
+        "📊 Bot Metrics:",
+        f"Total requests: {total}",
+        f"Successful: {success}",
+        f"Failed: {failed}",
+        f"Success rate: {success_rate:.1f}%",
+        f"Average response time: {avg_response_time:.2f}s",
+        "",
+        "Concurrent limit:",
+        f"Max concurrent: {state.settings.max_concurrent_requests}",
+        f"Current semaphore value: {state.request_semaphore._value}",
+    ]
+    
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
+    
+    user_id = update.effective_user.id
+    now = time.monotonic()
+    
+    # Clean old timestamps first
+    cutoff = now - 60.0
+    state.user_requests_minute[user_id] = deque(
+        (t for t in state.user_requests_minute[user_id] if t > cutoff),
+        maxlen=60
+    )
+    
+    requests_in_minute = len(state.user_requests_minute[user_id])
+    last_request_age = now - state.last_request.get(user_id, 0) if state.last_request.get(user_id) else float('inf')
+    wait_time = max(0, state.settings.request_interval - last_request_age)
+    
+    lines = [
+        "⏱️ Rate Limits:",
+        f"User {user_id}:",
+        f"  - Requests in last minute: {requests_in_minute}",
+        f"  - Last request: {last_request_age:.1f}s ago",
+        f"  - Cooldown: {state.settings.request_interval:.1f}s",
+    ]
+    
+    if wait_time > 0:
+        lines.append(f"  - Waiting: {wait_time:.1f}s")
+    else:
+        lines.append("  - Ready to send")
+    
+    lines.extend([
+        "",
+        "Global:",
+        f"  - Max concurrent: {state.settings.max_concurrent_requests}",
+        f"  - Available slots: {state.request_semaphore._value}",
+    ])
+    
+    await update.message.reply_text("\n".join(lines))
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     if not state.allowed(update.effective_user.id):
@@ -659,7 +773,9 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
-    await update.message.reply_text("Commands: /start /approve <telegram_user_id> /reject <telegram_user_id> /revoke <telegram_user_id> /users /status /reset /history /usage /addglobalprompt <text> /addprivateprompt <text> /shutdown /help")
+    await update.message.reply_text(
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
+    )
 
 
 async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,6 +806,7 @@ def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _ensure_logging_initialized()
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
     state: State = context.application.bot_data["state"]
@@ -699,10 +816,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (update.message.text or "").strip()[: state.settings.max_chars]
     if not text:
         return
+    
+    # Clean old request timestamps (> 1 minute ago)
     now = time.monotonic()
+    cutoff = now - 60.0
+    state.user_requests_minute[user_id] = deque(
+        (t for t in state.user_requests_minute[user_id] if t > cutoff),
+        maxlen=60
+    )
+    
     if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
         await update.message.reply_text("Please wait a moment before sending another message.")
         return
+    state.last_request[user_id] = now
+    state.user_requests_minute[user_id].append(now)
     provider = state.settings.provider
     allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
     if not allowed:
@@ -710,13 +837,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
         )
         return
-    state.last_request[user_id] = now
+    state.total_requests += 1
+    state.user_request_count[user_id] += 1
     state.history[user_id].append({"role": "user", "content": text})
     await state.persist()
     try:
-        async with state.request_gate:
+        # Acquire semaphore with logging to track concurrent requests
+        await state.request_semaphore.acquire()
+        start_time = time.monotonic()
+        try:
             result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id))
+            response_time = time.monotonic() - start_time
+            state.successful_requests += 1
+            state.total_response_time += response_time
+        finally:
+            state.request_semaphore.release()
     except ProviderTimeoutError:
+        state.failed_requests += 1
         state.history[user_id].pop()
         log_provider_failure(provider, "timeout")
         logger.exception("llama.cpp request timed out for user %s", user_id)
@@ -724,6 +861,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("The model request timed out. Please try again shortly.")
         return
     except RuntimeError:
+        state.failed_requests += 1
         state.history[user_id].pop()
         log_provider_failure(provider, "request_failed")
         logger.exception("llama.cpp request failed for user %s", user_id)
@@ -744,13 +882,14 @@ def main() -> None:
         logger.error("TELEGRAM_TOKEN environment variable not set")
         sys.exit(1)
     settings = Settings(token=token)
+    _ensure_logging_initialized()  # Initialize logging before starting
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
     # Load persisted state on startup
     app.bot_data["state"]._load()
     only_private = private()
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
-                "status": status, "reset": reset, "history": history,
+                "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
                 "shutdown": shutdown, "help": help_command, "usage": usage}
     for name, callback in commands.items():
