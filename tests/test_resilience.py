@@ -506,3 +506,41 @@ def test_handle_message_catches_http_client_error():
     assert state.failed_requests >= 1
     # Message sent
     assert mock_update.message.reply_text.called
+
+
+
+def test_handle_message_catches_http_client_error():
+    """Verify handle_message catches HTTPClientError and pops history."""
+    settings = Settings(token='test', allowed_user_ids={789})
+    state = State(settings)
+    user_id = 789
+    state.history[user_id] = []
+    state.successful_requests = 0
+    state.failed_requests = 0
+    state.request_semaphore = asyncio.Semaphore(1)
+    state.usage = MagicMock()
+    state.usage.reserve_request = MagicMock(return_value=(True, 100, 100))
+    state.total_requests = 0
+    state.user_request_count = {user_id: 0}
+    state.total_response_time = 0.0
+    
+    mock_update = MagicMock()
+    mock_update.message.content = "test message"
+    mock_update.message.reply_text = AsyncMock()
+    mock_update.effective_user.id = user_id
+    mock_update.effective_chat.type = "private"
+    
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+    
+    # Patch complete_with_usage to raise HTTPClientError
+    with patch('telegram_chat_bot.complete_with_usage', side_effect=HTTPClientError("HTTP 400: Bad Request")), \
+         patch.object(state, 'persist', return_value=None):
+        asyncio.run(handle_message(mock_update, mock_context))
+    
+    # History should be empty (user message popped as rollback)
+    assert len(state.history[user_id]) == 0
+    # Failed requests incremented
+    assert state.failed_requests >= 1
+    # Message sent
+    assert mock_update.message.reply_text.called
