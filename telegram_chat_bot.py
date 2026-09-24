@@ -91,6 +91,103 @@ class ProviderTimeoutError(RuntimeError):
     """Raised when the bounded provider request exceeds its timeout."""
 
 
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int = 5
+    success_threshold: int = 2
+    cooldown_seconds: float = 60.0
+    half_open_max_requests: int = 2
+
+    _state: CircuitState = CircuitState.CLOSED
+    _failure_count: int = 0
+    _success_count: int = 0
+    _last_failure_time: float | None = None
+    _half_open_requests: int = 0
+
+    def record_success(self) -> None:
+        if self._state == CircuitState.HALF_OPEN:
+            self._success_count += 1
+            if self._success_count >= self.success_threshold:
+                self._close()
+
+    def record_failure(self) -> None:
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+        if self._state == CircuitState.CLOSED and self._failure_count >= self.failure_threshold:
+            self._open()
+        elif self._state == CircuitState.HALF_OPEN:
+            self._open()
+
+    def _open(self) -> None:
+        self._state = CircuitState.OPEN
+        self._success_count = 0
+        self._half_open_requests = 0
+
+    def _close(self) -> None:
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time = None
+
+    def can_proceed(self) -> bool:
+        if self._state == CircuitState.CLOSED:
+            return True
+        if self._state == CircuitState.OPEN:
+            if self._last_failure_time and time.time() - self._last_failure_time >= self.cooldown_seconds:
+                self._state = CircuitState.HALF_OPEN
+                self._half_open_requests = 1
+                return True
+            return False
+        if self._state == CircuitState.HALF_OPEN:
+            if self._half_open_requests < self.half_open_max_requests:
+                self._half_open_requests += 1
+                return True
+            return False
+        return False
+
+    def get_state(self) -> str:
+        return self._state.value
+
+    def get_stats(self) -> dict:
+        return {
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            "success_count": self._success_count,
+            "last_failure_time": self._last_failure_time,
+            "half_open_requests": self._half_open_requests,
+        }
+
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 30.0
+    jitter: bool = True
+    retryable_errors: tuple[type[Exception], ...] = (ProviderTimeoutError, RuntimeError)
+
+
+_provider_circuit_breakers: dict[str, "CircuitBreaker"] = {}
+
+
+def get_circuit_breaker(provider: str) -> "CircuitBreaker":
+    if provider not in _provider_circuit_breakers:
+        _provider_circuit_breakers[provider] = CircuitBreaker()
+    return _provider_circuit_breakers[provider]
+
+
+def get_all_circuit_breaker_stats() -> dict[str, dict]:
+    return {provider: cb.get_stats() for provider, cb in _provider_circuit_breakers.items()}
+
+
 def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool = False) -> float:
     """Validate that *value* is a numeric string representing a positive number.
 
@@ -220,6 +317,15 @@ class Settings:
     openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
     max_concurrent_requests: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_CONCURRENT_REQUESTS", "2"), "MAX_CONCURRENT_REQUESTS", as_float=False))
 
+    # Resilience settings
+    circuit_breaker_failure_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"), "CIRCUIT_BREAKER_FAILURE_THRESHOLD"))
+    circuit_breaker_success_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", "2"), "CIRCUIT_BREAKER_SUCCESS_THRESHOLD"))
+    circuit_breaker_cooldown_seconds: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60.0"), "CIRCUIT_BREAKER_COOLDOWN_SECONDS", as_float=True))
+    max_retries: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_RETRIES", "3"), "MAX_RETRIES"))
+    retry_base_delay: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("RETRY_BASE_DELAY", "1.0"), "RETRY_BASE_DELAY", as_float=True))
+    retry_max_delay: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("RETRY_MAX_DELAY", "30.0"), "RETRY_MAX_DELAY", as_float=True))
+
+
 
 class RegistrationStore:
     """Persist pending and approved Telegram user registrations atomically."""
@@ -270,13 +376,23 @@ class CompletionResult:
         return self.prompt_tokens + self.completion_tokens
 
 
-def complete_with_usage(settings: Settings, messages: list[dict[str, str]]) -> CompletionResult:
+def complete_with_usage(settings: Settings, messages: list[dict[str, str]], provider: str | None = None) -> CompletionResult:
     """Make a model request with an independent timeout.
 
     Uses a ThreadPoolExecutor to run the HTTP request in a separate thread
     with a configurable timeout, ensuring a stalled provider cannot block
     the Telegram request.
     """
+    provider = provider or settings.provider
+    circuit_breaker = get_circuit_breaker(provider)
+    retry_config = RetryConfig(
+        max_retries=settings.max_retries,
+        base_delay=settings.retry_base_delay,
+        max_delay=settings.retry_max_delay,
+        jitter=True,
+        retryable_errors=(ProviderTimeoutError, RuntimeError),
+    )
+    
     payload = json.dumps({
         "model": settings.model,
         "messages": messages,
@@ -792,6 +908,37 @@ async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Tokens: {stats['total_tokens']} ({stats['prompt_tokens']} prompt, "
         f"{stats['completion_tokens']} completion)"
     )
+
+
+
+async def resilience_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show circuit breaker and resilience stats for all providers."""
+    state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
+    
+    cb_stats = get_all_circuit_breaker_stats()
+    failures = get_provider_failures()
+    
+    lines = ["Resilience Status:"]
+    
+    if cb_stats:
+        for provider, stats in cb_stats.items():
+            lines.append(f"  {provider}:")
+            lines.append(f"    State: {stats['state']}")
+            lines.append(f"    Failures: {stats['failure_count']}")
+            if stats['last_failure_time']:
+                since = time.time() - stats['last_failure_time']
+                lines.append(f"    Last failure: {since:.0f}s ago")
+    else:
+        lines.append("  No circuit breakers recorded yet.")
+    
+    if failures:
+        lines.append(f"\nRecent failures ({len(failures)}):")
+        for f in failures[-5:]:
+            lines.append(f"  - {f.provider}: {f.error_type}")
+    
+    await update.message.reply_text("\n".join(lines))
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
