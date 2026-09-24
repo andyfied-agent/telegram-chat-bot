@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import tempfile
 import time
@@ -179,9 +180,17 @@ class RetryConfig:
 _provider_circuit_breakers: dict[str, "CircuitBreaker"] = {}
 
 
-def get_circuit_breaker(provider: str) -> "CircuitBreaker":
+def get_circuit_breaker(provider: str, settings: Settings | None = None) -> "CircuitBreaker":
     if provider not in _provider_circuit_breakers:
-        _provider_circuit_breakers[provider] = CircuitBreaker()
+        if settings:
+            _provider_circuit_breakers[provider] = CircuitBreaker(
+                failure_threshold=settings.circuit_breaker_failure_threshold,
+                success_threshold=settings.circuit_breaker_success_threshold,
+                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+                half_open_max_requests=2,  # equals success_threshold
+            )
+        else:
+            _provider_circuit_breakers[provider] = CircuitBreaker()
     return _provider_circuit_breakers[provider]
 
 
@@ -385,13 +394,13 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
     the Telegram request.
     """
     provider = provider or settings.provider
-    circuit_breaker = get_circuit_breaker(provider)
+    circuit_breaker = get_circuit_breaker(provider, settings)
     retry_config = RetryConfig(
         max_retries=settings.max_retries,
         base_delay=settings.retry_base_delay,
         max_delay=settings.retry_max_delay,
         jitter=True,
-        retryable_errors=(ProviderTimeoutError, RuntimeError),
+        retryable_errors=(ProviderTimeoutError, RuntimeError, URLError, HTTPError),
     )
     
     payload = json.dumps({
@@ -420,21 +429,57 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
             raise ValueError("invalid token usage in model response")
         return CompletionResult(text=text[: settings.max_chars], prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens)
+    # Retry loop with circuit breaker
+    last_exception: Exception | None = None
+    attempt = 0
 
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(do_request)
-    try:
-        return future.result(timeout=settings.timeout)
-    except FuturesTimeoutError as exc:
-        future.cancel()
-        raise ProviderTimeoutError("model request timed out") from exc
-    except (HTTPError, URLError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
-        raise RuntimeError("model request failed") from exc
-    finally:
-        # Do not wait on a provider that has already exceeded the caller's
-        # deadline. The request itself has the same socket timeout and the
-        # future is cancelled when it has not started yet.
-        executor.shutdown(wait=False, cancel_futures=True)
+    while attempt <= retry_config.max_retries:
+        # Check circuit breaker before each attempt
+        if not circuit_breaker.can_proceed():
+            raise ProviderTimeoutError(f"Circuit breaker OPEN for provider '{provider}'")
+
+        try:
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(do_request)
+            try:
+                result = future.result(timeout=settings.timeout)
+                # Success: record and return
+                circuit_breaker.record_success()
+                return result
+            except FuturesTimeoutError as exc:
+                # Timeout: record failure, cancel future
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, "timeout")
+                future.cancel()
+                raise ProviderTimeoutError("model request timed out") from exc
+            except retry_config.retryable_errors as exc:
+                # Retryable error: record failure
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, type(exc).__name__)
+                last_exception = exc
+            except Exception as exc:
+                # Non-retryable error: record failure, raise immediately
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, type(exc).__name__)
+                raise ProviderTimeoutError(f"provider error: {type(exc).__name__}") from exc
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        except ProviderTimeoutError:
+            # If circuit breaker is now open, don't retry
+            if not circuit_breaker.can_proceed():
+                raise
+
+        attempt += 1
+        if attempt <= retry_config.max_retries:
+            # Exponential backoff with jitter
+            delay = min(retry_config.base_delay * (2 ** (attempt - 1)), retry_config.max_delay)
+            if retry_config.jitter:
+                delay *= (0.5 + random.random())
+            time.sleep(delay)
+
+    # Max retries exceeded
+    # Always raise ProviderTimeoutError after exhausting retries
+    raise ProviderTimeoutError(f"Provider '{provider}' failed after {retry_config.max_retries} retries")
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
@@ -1039,7 +1084,7 @@ def main() -> None:
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
-                "shutdown": shutdown, "help": help_command, "usage": usage}
+                "shutdown": shutdown, "help": help_command, "usage": usage, "resilience": resilience_status}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))

@@ -131,3 +131,140 @@ def test_log_provider_failure():
     failures = get_provider_failures()
     assert len(failures) == 1
     assert "http" not in str(failures[0])
+
+
+"""Integration tests for complete_with_usage with retries and circuit breaker."""
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from unittest.mock import MagicMock, patch
+import pytest
+from urllib.error import URLError, HTTPError
+
+from telegram_chat_bot import (
+    Settings,
+    _provider_circuit_breakers,
+    complete_with_usage,
+    ProviderTimeoutError,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_provider_state():
+    """Reset provider state between tests."""
+    _provider_circuit_breakers.clear()
+    yield
+    _provider_circuit_breakers.clear()
+
+
+def test_complete_with_usage_retries_on_retryable_error():
+    """Verify complete_with_usage retries on URLError."""
+    call_counter = {"count": 0}
+    
+    def mock_urlopen(*args, **kwargs):
+        call_counter["count"] += 1
+        if call_counter["count"] < 4:
+            from urllib.error import URLError
+            raise URLError("transient failure")
+        # Fourth call succeeds - return a proper mock response object
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "response"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        }).encode()
+        # Make it work as a context manager
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+    
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        result = complete_with_usage(settings, messages)
+    
+    assert call_counter["count"] == 4
+    assert result.text == "response"
+
+
+def test_complete_with_usage_trips_circuit_breaker():
+    """Verify circuit breaker trips after failure threshold."""
+    # Use failure_threshold=3 so it trips after 3 failures
+    settings = Settings(token='test', circuit_breaker_failure_threshold=3, max_retries=3)
+    messages = [{"role": "user", "content": "hello"}]
+    
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise URLError("connection failed")
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(ProviderTimeoutError):
+            complete_with_usage(settings, messages)
+    
+    # Circuit breaker will trip after 3 failures, which happens on the 3rd attempt
+    # (1 initial + 2 retries = 3 attempts, then circuit trips)
+    assert call_count == 3
+    cb = _provider_circuit_breakers.get(settings.provider)
+    assert cb is not None
+    assert cb.get_state() == "open"
+
+
+def test_complete_with_usage_respects_open_circuit_breaker():
+    """Verify complete_with_usage rejects requests when circuit is open."""
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    # First, trip the circuit breaker
+    def mock_urlopen_fail(*args, **kwargs):
+        raise URLError("connection failed")
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen_fail):
+        with pytest.raises(ProviderTimeoutError):
+            complete_with_usage(settings, messages)
+    
+    # Now try again - should fail immediately due to open circuit
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen_fail):
+        with pytest.raises(ProviderTimeoutError) as exc_info:
+            complete_with_usage(settings, messages)
+        assert "Circuit breaker OPEN" in str(exc_info.value)
+
+
+def test_complete_with_usage_records_timeout_failure():
+    """Verify FuturesTimeoutError triggers circuit breaker failure recording."""
+    settings = Settings(token='test', timeout=0.01)  # Very short timeout
+    messages = [{"role": "user", "content": "hello"}]
+    
+    def mock_urlopen(*args, **kwargs):
+        import time
+        time.sleep(0.1)  # Longer than timeout
+        return MagicMock()
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(ProviderTimeoutError):
+            complete_with_usage(settings, messages)
+    
+    # Verify failure was recorded
+    cb = _provider_circuit_breakers.get(settings.provider)
+    assert cb is not None
+    assert cb._failure_count >= 1
+
+
+def test_complete_with_usage_max_retries_exceeded():
+    """Verify complete_with_usage raises after max retries."""
+    settings = Settings(token='test')
+    messages = [{"role": "user", "content": "hello"}]
+    
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise URLError("connection failed")
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(ProviderTimeoutError) as exc_info:
+            complete_with_usage(settings, messages)
+        assert "failed after 3 retries" in str(exc_info.value)
+    
+    assert call_count == 4  # 1 initial + 3 retries
