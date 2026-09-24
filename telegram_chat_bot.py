@@ -16,6 +16,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
+from enum import Enum
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
