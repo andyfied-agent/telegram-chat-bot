@@ -1,17 +1,8 @@
-[tool.poetry]
-name = "telegram-chat-bot"
-version = "0.1.0"
-description = "Telegram chat bot running on Ministral"
-authors = ["andyfied-Thargoid <andyfied@users.noreply.github.com>"]
-license = "MIT"
+[tool.ruff]
+line-length = 100
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-python-telegram-bot = "==21.10"
-
-[tool.poetry.dev-dependencies]
-pytest = "==8.4.2"
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[tool.ruff.lint]
+# Allow imports anywhere (for test isolation in separate sections)
+per-file-ignores = [
+    "tests/test_resilience.py:E402",  # Module level import not at top
+]
