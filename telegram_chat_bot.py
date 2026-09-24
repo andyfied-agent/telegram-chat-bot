@@ -509,7 +509,9 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]], prov
             time.sleep(delay)
 
     # Max retries exceeded
-    # Always raise ProviderTimeoutError after exhausting retries
+    # Raise with cause if we have one, otherwise without
+    if last_exception is not None:
+        raise ProviderTimeoutError(f"Provider '{provider}' failed after {retry_config.max_retries} retries") from last_exception
     raise ProviderTimeoutError(f"Provider '{provider}' failed after {retry_config.max_retries} retries")
 
 
