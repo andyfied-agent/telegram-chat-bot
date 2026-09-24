@@ -47,6 +47,9 @@ echo "Upgrading pip..."
 echo "Installing dependencies..."
 .venv/bin/python3 -m pip install -r requirements.lock
 
+echo "Creating log directory for centralized logging..."
+mkdir -p /mnt/scratch/hermes/logs
+
 echo ""
 echo "Installation complete!"
 echo "To use the bot:"
