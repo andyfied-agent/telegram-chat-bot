@@ -1,6 +1,7 @@
 """Tests for resilience features."""
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from unittest.mock import MagicMock, patch
+import asyncio
 import json
 import pytest
 import time
@@ -134,22 +135,6 @@ def test_log_provider_failure():
     assert "http" not in str(failures[0])
 
 
-"""Integration tests for complete_with_usage with retries and circuit breaker."""
-from concurrent.futures import TimeoutError as FuturesTimeoutError
-from unittest.mock import MagicMock, patch
-import pytest
-from urllib.error import URLError, HTTPError
-
-from telegram_chat_bot import (
-    Settings,
-    _provider_circuit_breakers,
-    complete_with_usage,
-    ProviderTimeoutError,
-    HTTPClientError,
-)
-
-
-@pytest.fixture(autouse=True)
 def reset_provider_state():
     """Reset provider state between tests."""
     _provider_circuit_breakers.clear()
@@ -274,7 +259,6 @@ def test_complete_with_usage_max_retries_exceeded():
 
 """Test HTTP retry policy."""
 from unittest.mock import MagicMock, patch
-import pytest
 from urllib.error import HTTPError
 
 from telegram_chat_bot import (
@@ -395,3 +379,113 @@ def test_http_503_retryable():
     
     assert call_count == 2
     assert result.text == "response"
+
+
+"""Regression tests for HTTPClientError history consistency."""
+from unittest.mock import MagicMock, patch
+import json
+import pytest
+from urllib.error import HTTPError
+
+from telegram_chat_bot import (
+    Settings,
+    State,
+    HTTPClientError,
+    _provider_circuit_breakers,
+    handle_message,
+    complete_with_usage,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    _provider_circuit_breakers.clear()
+    yield
+    _provider_circuit_breakers.clear()
+
+
+def test_http_400_raises_client_error():
+    """Verify HTTP 400 raises HTTPClientError, not retried."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        http_error = HTTPError("http://test", 400, "Bad Request", {}, None)
+        raise http_error
+    
+    settings = Settings(token='test')
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        with pytest.raises(HTTPClientError) as exc_info:
+            complete_with_usage(settings, [{"role": "user", "content": "hello"}])
+    
+    assert call_count == 1
+    assert "HTTP 400" in str(exc_info.value)
+
+
+def test_http_500_retries():
+    """Verify HTTP 500 is retried and succeeds on second attempt."""
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            http_error = HTTPError("http://test", 500, "Internal Server Error", {}, None)
+            raise http_error
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "response"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10}
+        }).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+    
+    settings = Settings(token='test')
+    
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        result = complete_with_usage(settings, [{"role": "user", "content": "hello"}])
+    
+    assert call_count == 2
+    assert result.text == "response"
+
+
+def test_handle_message_catches_http_client_error():
+    """Verify handle_message catches HTTPClientError and pops history."""
+    settings = Settings(token='test')
+    state = State(settings)
+    user_id = 789
+    # Start with empty history - handler will append user message then pop it on error
+    state.history[user_id] = []
+    state.successful_requests = 0
+    state.failed_requests = 0
+    
+    mock_update = MagicMock()
+    mock_update.message.reply_text = MagicMock()
+    mock_update.effective_user.id = user_id
+    mock_update.effective_chat.type = "private"
+    
+    mock_context = MagicMock()
+    mock_context.application.bot_data = {"state": state}
+    
+    call_count = 0
+    
+    def mock_urlopen(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        http_error = HTTPError("http://test", 400, "Bad Request", {}, None)
+        raise http_error
+    
+    # Don't patch asyncio.to_thread - let it work normally
+    with patch('telegram_chat_bot.urlopen', side_effect=mock_urlopen):
+        # Just call the handler, it will handle the exception internally
+        asyncio.run(handle_message(mock_update, mock_context))
+    
+    # History should be empty (user message popped as rollback)
+    assert len(state.history[user_id]) == 0
+    # Failed requests incremented
+    assert state.failed_requests >= 1
+    # Message sent
+    assert mock_update.message.reply_text.called

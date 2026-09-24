@@ -1078,18 +1078,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state.total_response_time += response_time
         finally:
             state.request_semaphore.release()
-    except ProviderTimeoutError:
+    except (ProviderTimeoutError, RuntimeError, HTTPClientError):
         state.failed_requests += 1
         state.history[user_id].pop()
-        log_provider_failure(provider, "timeout")
-        logger.exception("llama.cpp request timed out for user %s", user_id)
-        await state.persist()
-        await update.message.reply_text("The model request timed out. Please try again shortly.")
-        return
-    except RuntimeError:
-        state.failed_requests += 1
-        state.history[user_id].pop()
-        log_provider_failure(provider, "request_failed")
+        log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await state.persist()
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
