@@ -1,9 +1,10 @@
 """Tests for resilience features."""
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from unittest.mock import MagicMock, patch
 import json
-import time
 import pytest
-from urllib.error import URLError
+import time
+from urllib.error import URLError, HTTPError
 
 from telegram_chat_bot import (
     CircuitBreaker,

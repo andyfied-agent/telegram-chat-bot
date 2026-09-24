@@ -967,7 +967,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
     )
 
 
