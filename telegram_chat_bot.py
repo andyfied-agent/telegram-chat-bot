@@ -1745,6 +1745,8 @@ async def main() -> None:
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     
     logger.info("Starting bot with llama.cpp model %s", settings.model)
+    # PTB lifecycle: initialize → updater polling → application start → updater stop → application stop → shutdown
+    await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     try:
@@ -1753,6 +1755,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        await app.updater.stop()
         await app.stop()
         await app.shutdown()
 

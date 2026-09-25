@@ -122,11 +122,11 @@ The following GitHub issues have been addressed:
 |||| Low Priority | 9 | 9 | 0 |
 |||| **Total** | **14** | **14** | **0** |
 
-**Test Coverage:** 184/184 tests passing, Ruff 1 unused import (BotCommandScopeAllChatAdministrators)
+**Test Coverage:** 184/184 tests passing, Ruff clean
 
-**Next Action:** All tracked issues complete. PR #44 ready for CI review (184/184 tests passing, 1 unused import cleanup pending).
+**Next Action:** All tracked issues complete. PR #44 ready for review (184/184 tests passing, Ruff clean).
 
 ---
 
 **Last updated:** 2026-09-25
-**Bot version:** Latest (184/184 tests passing, Ruff 1 unused import)
+**Bot version:** Latest (184/184 tests passing, Ruff clean)
