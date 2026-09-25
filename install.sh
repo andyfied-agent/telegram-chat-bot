@@ -47,8 +47,12 @@ echo "Upgrading pip..."
 echo "Installing dependencies..."
 .venv/bin/python3 -m pip install -r requirements.lock
 
-echo "Creating log directory for centralized logging..."
-mkdir -p /mnt/scratch/hermes/logs
+echo "Creating log directory..."
+# Default to user state directory (portable), override with /mnt/scratch/hermes/logs on compute01
+log_dir="${TELEGRAM_BOT_LOG_DIR:-~/.local/state/telegram-chat-bot/logs}"
+# Safe expansion without eval - use shell parameter expansion
+log_dir_expanded="${log_dir/#\~/$HOME}"
+mkdir -p "$log_dir_expanded"
 
 echo ""
 echo "Installation complete!"
@@ -56,5 +60,7 @@ echo "To use the bot:"
 echo "  1. Get a bot token from @BotFather on Telegram"
 echo "  2. Set the token as an environment variable:"
 echo '     export TELEGRAM_TOKEN="your_token_here"'
-echo "  3. Run the bot with:"
+echo "  3. (Optional) Override log directory for compute01:"
+echo '     export TELEGRAM_BOT_LOG_DIR="/mnt/scratch/hermes/logs"'
+echo "  4. Run the bot with:"
 echo "     ./telegram-chat-bot.sh"

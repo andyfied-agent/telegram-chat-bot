@@ -32,12 +32,11 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Implementation:** ✅ Complete - Shows total/successful/failed requests, success rate, avg response time, concurrent limit.
 
 ### 7. Group Chat Support
-**Status:** Open  
-**Priority:** Medium  
-**Description:** The bot currently only responds in private (direct) messages.  
-**Solution:** Add optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
+**Status:** Complete  
+**Description:** Added optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
+**Solution:** Implemented group filtering, per-group state, and group registration workflow.  
 **Impact:** Enables bot usage in moderated group chats and team workspaces.
-**Blocked:** Not started - Requires significant refactoring.
+**Implementation:** ✅ Complete - Added group context management, @mention detection, and group registration commands.
 
 ---
 
@@ -57,12 +56,47 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Data durability and recovery.  
 **Implementation:** ✅ Complete - Daily backups with rotation policy.
 
+### 38. Group Context Management
+**Status:** Complete  
+**Description:** Group-specific history exists, but `/history` and `/reset` are private-only.  
+**Solution:** Extend `/history` and `/reset` to work in groups with per-user context.  
+**Impact:** Users can inspect and reset their group conversation history.  
+**Implementation:** ✅ Complete - Commands now support group context with proper authorization.
+
 ### 8. Group Chat Registration System
-**Status:** Open  
-**Description:** Groups would need their own registration/approval system.  
-**Solution:** Extend `RegistrationStore` to handle group IDs.  
+**Status:** Complete  
+**Description:** Groups need their own registration/approval system.  
+**Solution:** Implemented `/startgroup`, `/approvegroup`, `/rejectgroup`, `/revokegroup` commands.  
 **Impact:** Admin control over group interactions.
-**Status:** 🔴 Blocked - Depends on Issue #7.
+**Implementation:** ✅ Complete - Group registration store and approval workflow implemented.
+
+### 33. Private Prompts Isolation
+**Status:** Complete  
+**Description:** Private prompts leak into group chat requests.  
+**Solution:** Add group-scoped prompts and ensure private prompts are only used for private chats.  
+**Impact:** Secure separation of private and group contexts.  
+**Implementation:** ✅ Complete - Added `group_prompts` dict, `setgroupprompt`/`cleargroupprompt`/`showgroupprompt` commands, and updated `messages()` to use group prompts for group requests.
+
+### 34. Configurable Group Access Policy
+**Status:** Complete  
+**Description:** Group access mode should be configurable (`all` vs `approved_users` vs `admins`).  
+**Solution:** Add `GROUP_ACCESS_MODE` environment variable and update `allowed_group()` to enforce the policy.  
+**Impact:** Flexible group authorization policies.  
+**Implementation:** ✅ Complete - Added `group_access_mode` setting and updated authorization logic.
+
+### 41. Improve User-Facing Error Messages
+**Status:** Complete  
+**Description:** Generic error messages don't help users understand what went wrong.  
+**Solution:** Provide specific messages for timeouts vs server errors vs other failures.  
+**Impact:** Better user experience and troubleshooting.  
+**Implementation:** ✅ Complete - Added differentiated messages for timeout, HTTP error, and general failures.
+
+### 39. Telegram Native Command Menu
+**Status:** Complete  
+**Description:** Users can't see available commands without typing `/`.  
+**Solution:** Register `BotCommand` menu with scopes for private chats, group chats, and admins.  
+**Impact:** Discoverability of bot features.  
+**Implementation:** ✅ Complete - Registered command menus with descriptions for all scopes.
 
 ---
 
@@ -81,18 +115,18 @@ The following GitHub issues have been addressed:
 
 ## Current Status Summary
 
-| Category | Total | Complete | Remaining |
-|----------|-------|----------|-----------|
-| High Priority | 1 | 1 | 0 |
-| Medium Priority | 3 | 2 | 1 |
-| Low Priority | 3 | 2 | 1 |
-| **Total** | **7** | **5** | **2** |
+|||| Category | Total | Complete | Remaining |
+||||----------|-------|----------|-----------|
+|||| High Priority | 1 | 1 | 0 |
+|||| Medium Priority | 4 | 4 | 0 |
+|||| Low Priority | 9 | 9 | 0 |
+|||| **Total** | **14** | **14** | **0** |
 
-**Test Coverage:** 115 tests passing (100 from main + 15 new tests for concurrent limiting, rate-limit visibility, and logging)
+**Test Coverage:** 184/184 tests passing, Ruff clean
 
-**Next Action:** Issue #7 (Group Chat Support) requires significant refactoring; not prioritized.
+**Next Action:** All tracked issues complete. PR #44 ready for review (184/184 tests passing, Ruff clean).
 
 ---
 
-**Last updated:** 2026-09-24
-**Bot version:** Latest (all 115 tests pass, service running)
+**Last updated:** 2026-09-25
+**Bot version:** Latest (184/184 tests passing, Ruff clean)

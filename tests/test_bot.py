@@ -374,7 +374,7 @@ def test_complete_independent_timeout():
 
 @pytest.mark.asyncio
 async def test_handle_message_rejects_unallowlisted_user():
-    """handle_message must return early without any reply when user is not allowlisted."""
+    """handle_message must send onboarding message when user is not allowlisted."""
     from telegram_chat_bot import handle_message, State
 
     # No env set → allowed_user_ids is empty → everyone rejected
@@ -385,15 +385,17 @@ async def test_handle_message_rejects_unallowlisted_user():
     mock_update.effective_chat.type = "private"
     mock_update.effective_user.id = 999
     mock_update.message.text = "hello"
-    mock_update.message.reply_text = MagicMock()
+    mock_update.message.reply_text = AsyncMock()
 
     mock_context = MagicMock()
     mock_context.application.bot_data = {"state": state}
 
     await handle_message(mock_update, mock_context)
 
-    # No reply should have been sent
-    mock_update.message.reply_text.assert_not_called()
+    # Onboarding message should be sent
+    mock_update.message.reply_text.assert_called_once()
+    call_args = mock_update.message.reply_text.call_args[0][0]
+    assert "access" in call_args.lower()
 
 
 @pytest.mark.asyncio
@@ -464,9 +466,11 @@ async def test_handle_message_model_failure_rollback():
     with patch("telegram_chat_bot.complete_with_usage", side_effect=RuntimeError("model request failed")):
         await handle_message(mock_update, mock_context)
 
-    mock_update.message.reply_text.assert_called_once_with(
-        "I couldn't reach the local model. Please try again shortly."
-    )
+    mock_update.message.reply_text.assert_called_once()
+    call_args = mock_update.message.reply_text.call_args[0][0]
+    assert "failed" in call_args.lower()
+    assert "try again shortly" in call_args.lower()
+    assert "admin" not in call_args.lower()  # No false admin notification claim
     assert len(state.history[123]) == 0
 
 
@@ -924,9 +928,14 @@ async def test_rejected_registration_cannot_start_or_chat(tmp_path):
 
     assert state.user_registrations.status(123) == "rejected"
     assert list(state.history[123]) == []
-    update.message.reply_text.assert_awaited_once_with(
-        "Your access request was rejected by an administrator."
-    )
+    # Two replies: /start rejection + handle_message rejection
+    assert update.message.reply_text.call_count == 2
+    # First call: /start rejection
+    call1 = update.message.reply_text.call_args_list[0][0][0]
+    assert "rejected" in call1.lower()
+    # Second call: handle_message rejection (same message for simplicity)
+    call2 = update.message.reply_text.call_args_list[1][0][0]
+    assert "rejected" in call2.lower()
 
 
 @pytest.mark.asyncio
