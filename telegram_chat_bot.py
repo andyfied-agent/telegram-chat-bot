@@ -309,8 +309,15 @@ def _parse_user_rate_limits(value: str) -> dict[int, float]:
             user_id = int(user_id_str)
         except ValueError:
             raise ValueError(f"USER_RATE_LIMITS user IDs must be integers, got {user_id_str!r}")
-        if not isinstance(interval, (int, float)) or interval <= 0:
+        if isinstance(interval, bool):
+            raise ValueError(f"USER_RATE_LIMITS values must be numbers, not booleans (true/false)")
+        if not isinstance(interval, (int, float)):
             raise ValueError(f"USER_RATE_LIMITS values must be positive numbers, got {interval!r}")
+        if interval <= 0:
+            raise ValueError(f"USER_RATE_LIMITS values must be positive, got {interval!r}")
+        # Reject NaN and Infinity
+        if math.isnan(interval) or math.isinf(interval):
+            raise ValueError(f"USER_RATE_LIMITS values must be finite numbers")
         limits[user_id] = float(interval)
     return limits
 
@@ -1233,14 +1240,17 @@ async def ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     requests_in_minute = len(state.user_requests_minute[user_id])
     last_request_age = now - state.last_request.get(user_id, 0) if state.last_request.get(user_id) else float('inf')
-    wait_time = max(0, state.settings.request_interval - last_request_age)
+    
+    # Use per-user rate limit or fall back to global
+    user_rate_limit = state.settings.user_rate_limits.get(user_id, state.settings.request_interval)
+    wait_time = max(0, user_rate_limit - last_request_age)
     
     lines = [
         "⏱️ Rate Limits:",
         f"User {user_id}:",
         f"  - Requests in last minute: {requests_in_minute}",
         f"  - Last request: {last_request_age:.1f}s ago",
-        f"  - Cooldown: {state.settings.request_interval:.1f}s",
+        f"  - Cooldown: {user_rate_limit:.1f}s",
     ]
     
     if wait_time > 0:
@@ -1264,7 +1274,14 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not state.allowed(update.effective_user.id):
         return
     
-    model_name, is_online = health_check(state.settings.base_url, state.settings.timeout)
+    # Use a short timeout to avoid blocking the event loop
+    health_timeout = min(5.0, state.settings.timeout / 10)
+    model_name, is_online = await asyncio.to_thread(
+        health_check, state.settings.base_url, health_timeout
+    )
+    
+    # Show the configured model name, not what /health returns (which may not include it)
+    model_name = state.settings.model
     
     lines = [
         "🏥 Health Check:",
