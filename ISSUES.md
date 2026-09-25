@@ -70,6 +70,20 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Admin control over group interactions.
 **Implementation:** ✅ Complete - Group registration store and approval workflow implemented.
 
+### 33. Private Prompts Isolation
+**Status:** Complete  
+**Description:** Private prompts leak into group chat requests.  
+**Solution:** Add group-scoped prompts and ensure private prompts are only used for private chats.  
+**Impact:** Secure separation of private and group contexts.  
+**Implementation:** ✅ Complete - Added `group_prompts` dict, `setgroupprompt`/`cleargroupprompt`/`showgroupprompt` commands, and updated `messages()` to use group prompts for group requests.
+
+### 34. Configurable Group Access Policy
+**Status:** Complete  
+**Description:** Group access mode should be configurable (`all` vs `approved_users` vs `admins`).  
+**Solution:** Add `GROUP_ACCESS_MODE` environment variable and update `allowed_group()` to enforce the policy.  
+**Impact:** Flexible group authorization policies.  
+**Implementation:** ✅ Complete - Added `group_access_mode` setting and updated authorization logic.
+
 ---
 
 ## Resolved Issues
@@ -87,12 +101,12 @@ The following GitHub issues have been addressed:
 
 ## Current Status Summary
 
-||| Category | Total | Complete | Remaining |
-|||----------|-------|----------|-----------|
-||| High Priority | 1 | 1 | 0 |
-||| Medium Priority | 4 | 4 | 0 |
-||| Low Priority | 5 | 5 | 0 |
-||| **Total** | **10** | **10** | **0** |
+|||| Category | Total | Complete | Remaining |
+||||----------|-------|----------|-----------|
+|||| High Priority | 1 | 1 | 0 |
+|||| Medium Priority | 4 | 4 | 0 |
+|||| Low Priority | 7 | 7 | 0 |
+|||| **Total** | **12** | **12** | **0** |
 
 **Test Coverage:** 115 tests passing (100 from main + 15 new tests for concurrent limiting, rate-limit visibility, and logging)
 

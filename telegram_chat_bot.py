@@ -418,6 +418,8 @@ class Settings:
     allowed_group_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_GROUP_IDS", "").split(",") if value.strip()
     ))
+    # Group access mode: "all", "approved_users", or "admins" (default: "all")
+    group_access_mode: str = field(default_factory=lambda: os.getenv("GROUP_ACCESS_MODE", "all"))
     request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
@@ -791,6 +793,7 @@ class State:
         )
         self.global_prompt = ""
         self.private_prompts: dict[int, str] = {}
+        self.group_prompts: dict[int, str] = {}
         self.last_request: dict[int, float] = {}
         self.request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
         # Separate registration stores for users and groups
@@ -816,6 +819,7 @@ class State:
         data = _read_state(self.settings.state_file)
         self.global_prompt = data.get("global_prompt", "")
         self.private_prompts = {int(k): v for k, v in data.get("private_prompts", {}).items()}
+        self.group_prompts = {int(k): v for k, v in data.get("group_prompts", {}).items()}
         user_history = data.get("user_history", {})
         for user_key_str, msgs in user_history.items():
             # Deserialize keys: if contains ":", it's "user_id:group_id" tuple; otherwise int
@@ -851,6 +855,7 @@ class State:
         data = {
             "global_prompt": self.global_prompt,
             "private_prompts": self.private_prompts,
+            "group_prompts": self.group_prompts,
             "user_history": user_history,
             "last_request": self.last_request,
             "usage": self.usage.to_dict(),
@@ -878,13 +883,42 @@ class State:
             return "approved"
         return self.user_registrations.status(user_id) or "unregistered"
     
-    def allowed_group(self, group_id: int) -> bool:
-        """Check if group is allowed via TELEGRAM_ALLOWED_GROUP_IDS OR approved registration."""
-        # Check both static allowlist and registration store
+    def allowed_group(self, group_id: int, user_id: int | None = None) -> bool:
+        """Check if group is allowed via TELEGRAM_ALLOWED_GROUP_IDS OR approved registration.
+        
+        Args:
+            group_id: The group ID to check
+            user_id: Optional user ID for access mode checks (default: None)
+        
+        Returns:
+            True if the group is allowed for the given user (or any user if user_id not specified)
+        """
+        # Check static allowlist first
         if group_id in self.settings.allowed_group_ids:
-            return True
+            # If access mode is "all", any user can use it
+            if self.settings.group_access_mode == "all":
+                return True
+            # Otherwise check user authorization
+            if user_id is not None:
+                if self.settings.group_access_mode == "approved_users":
+                    return self.allowed(user_id)
+                elif self.settings.group_access_mode == "admins":
+                    return self.admin(user_id)
+            return True  # Default to True if no user_id provided
+        
+        # Check group registration
         if self.group_registrations.status(group_id) == "approved":
-            return True
+            # If access mode is "all", any user can use it
+            if self.settings.group_access_mode == "all":
+                return True
+            # Otherwise check user authorization
+            if user_id is not None:
+                if self.settings.group_access_mode == "approved_users":
+                    return self.allowed(user_id)
+                elif self.settings.group_access_mode == "admins":
+                    return self.admin(user_id)
+            return True  # Default to True if no user_id provided
+        
         return False
     
     def admin(self, user_id: int) -> bool:
@@ -894,7 +928,10 @@ class State:
         """Return messages for user (and group if specified)."""
         key = _state_key(user_id, group_id)
         prompt = self.global_prompt
-        if self.private_prompts.get(user_id):
+        # For group requests, use group prompt instead of private prompt
+        if group_id and self.group_prompts.get(group_id):
+            prompt = f"{prompt}\n{self.group_prompts[group_id]}".strip()
+        elif self.private_prompts.get(user_id):
             prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
         result = ([{"role": "system", "content": prompt}] if prompt else [])
         result.extend(self.history[key])
@@ -1260,6 +1297,104 @@ async def addprivateprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("Private prompt updated.")
 
 
+# Group prompt management commands
+async def setgroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set a prompt for a specific group (admin only)."""
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.admin(user_id):
+        await update.message.reply_text("Only administrators can set group prompts.")
+        return
+    
+    chat_type = update.effective_chat.type
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
+    
+    if not group_id:
+        await update.message.reply_text("This command must be sent in a group chat, or use `/setgroupprompt <group_id> <prompt>` in private.")
+        return
+    
+    # If args provided, parse group_id and prompt
+    if context.args:
+        # Try to parse: /setgroupprompt <group_id> <prompt>
+        group_id_str = context.args[0]
+        try:
+            group_id = int(group_id_str)
+        except ValueError:
+            await update.message.reply_text("Invalid group ID format.")
+            return
+        
+        prompt = " ".join(context.args[1:]).strip()
+    else:
+        # Use current chat's group_id
+        prompt = " ".join(context.args).strip() if context.args else ""
+    
+    if not prompt:
+        await update.message.reply_text("Usage: /setgroupprompt <prompt> (in group) or /setgroupprompt <group_id> <prompt> (private)")
+        return
+    
+    state.group_prompts[group_id] = prompt[: state.settings.max_chars]
+    await state.persist()
+    await update.message.reply_text(f"Group prompt set for group {group_id}.")
+
+
+async def cleargroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear a group prompt (admin only)."""
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.admin(user_id):
+        await update.message.reply_text("Only administrators can clear group prompts.")
+        return
+    
+    chat_type = update.effective_chat.type
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
+    
+    if not group_id:
+        await update.message.reply_text("Usage: /cleargroupprompt (in group) or /cleargroupprompt <group_id> (private)")
+        return
+    
+    if context.args:
+        try:
+            group_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid group ID format.")
+            return
+    
+    if group_id in state.group_prompts:
+        del state.group_prompts[group_id]
+        await state.persist()
+        await update.message.reply_text(f"Group prompt cleared for group {group_id}.")
+    else:
+        await update.message.reply_text(f"No group prompt found for group {group_id}.")
+
+
+async def showgroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show a group prompt (admin only)."""
+    state: State = context.application.bot_data["state"]
+    user_id = update.effective_user.id
+    if not state.admin(user_id):
+        await update.message.reply_text("Only administrators can view group prompts.")
+        return
+    
+    chat_type = update.effective_chat.type
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
+    
+    if not group_id:
+        await update.message.reply_text("Usage: /showgroupprompt (in group) or /showgroupprompt <group_id> (private)")
+        return
+    
+    if context.args:
+        try:
+            group_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid group ID format.")
+            return
+    
+    if group_id in state.group_prompts:
+        await update.message.reply_text(f"Group prompt for {group_id}: {state.group_prompts[group_id]}")
+    else:
+        await update.message.reply_text(f"No group prompt found for group {group_id}.")
+
+
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
@@ -1270,7 +1405,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help\n\n"
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /setgroupprompt <text> /showgroupprompt /cleargroupprompt /shutdown /help\n\n"
         "Group commands (admin only): /startgroup <id> /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
     )
 
@@ -1427,7 +1562,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Group chat message handling (new)
     elif chat_type in ("group", "supergroup"):
         # Check if group is allowed (static allowlist OR approved registration)
-        if not state.allowed_group(group_id):
+        if not state.allowed_group(group_id, user_id):
             return  # Silent ignore for disallowed groups
         
         # Get bot username for @mention check
@@ -1518,6 +1653,7 @@ def main() -> None:
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
+                "setgroupprompt": setgroupprompt, "cleargroupprompt": cleargroupprompt, "showgroupprompt": showgroupprompt,
                 "shutdown": shutdown, "help": help_command, "usage": usage, "resilience": resilience_status}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
