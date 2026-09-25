@@ -20,4 +20,3 @@ build-backend = "poetry.core.masonry.api"
 line-length = 100
 
 [tool.ruff.lint]
-per-file-ignores = { "tests/test_resilience.py" = ["E402", "F811"] }

@@ -17,6 +17,10 @@ from telegram_chat_bot import (
     get_all_circuit_breaker_stats,
     get_circuit_breaker,
     get_provider_failures,
+    handle_message,
+    HTTPClientError,
+    ProviderTimeoutError,
+    State,
     log_provider_failure,
 )
 
@@ -131,13 +135,6 @@ def test_log_provider_failure():
     failures = get_provider_failures()
     assert len(failures) == 1
     assert "http" not in str(failures[0])
-
-
-def reset_provider_state():
-    """Reset provider state between tests."""
-    _provider_circuit_breakers.clear()
-    yield
-    _provider_circuit_breakers.clear()
 
 
 def test_complete_with_usage_retries_on_retryable_error():
@@ -255,26 +252,6 @@ def test_complete_with_usage_max_retries_exceeded():
     assert call_count == 4  # 1 initial + 3 retries
 
 
-"""Test HTTP retry policy."""
-from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.error import HTTPError
-
-from telegram_chat_bot import (
-    Settings,
-    _provider_circuit_breakers,
-    complete_with_usage,
-    ProviderTimeoutError,
-    HTTPClientError,
-)
-
-
-@pytest.fixture(autouse=True)
-def reset_circuit_breakers():
-    _provider_circuit_breakers.clear()
-    yield
-    _provider_circuit_breakers.clear()
-
-
 def test_http_400_not_retryable():
     """400 Bad Request should NOT be retried."""
     call_count = 0
@@ -379,29 +356,6 @@ def test_http_503_retryable():
     assert result.text == "response"
 
 
-"""Regression tests for HTTPClientError history consistency."""
-from unittest.mock import AsyncMock, MagicMock, patch
-import json
-import pytest
-from urllib.error import HTTPError
-
-from telegram_chat_bot import (
-    Settings,
-    State,
-    HTTPClientError,
-    _provider_circuit_breakers,
-    handle_message,
-    complete_with_usage,
-)
-
-
-@pytest.fixture(autouse=True)
-def reset_state():
-    _provider_circuit_breakers.clear()
-    yield
-    _provider_circuit_breakers.clear()
-
-
 def test_http_400_raises_client_error():
     """Verify HTTP 400 raises HTTPClientError, not retried."""
     call_count = 0
@@ -450,7 +404,6 @@ def test_http_500_retries():
     assert result.text == "response"
 
 
-
 def test_complete_with_usage_raises_http_client_error_for_4xx():
     """Verify complete_with_usage raises HTTPClientError for 4xx errors."""
     call_count = [0]  # Use list for thread-safe counter
@@ -468,159 +421,6 @@ def test_complete_with_usage_raises_http_client_error_for_4xx():
     
     assert call_count[0] == 1
     assert "HTTP 400" in str(exc_info.value)
-
-
-
-def test_handle_message_catches_http_client_error():
-    """Verify handle_message catches HTTPClientError and pops history."""
-    settings = Settings(token='test', allowed_user_ids={789})
-    state = State(settings)
-    user_id = 789
-    state.history[user_id] = []
-    state.successful_requests = 0
-    state.failed_requests = 0
-    state.request_semaphore = asyncio.Semaphore(1)
-    state.usage = MagicMock()
-    state.usage.reserve_request = MagicMock(return_value=(True, 100, 100))
-    state.total_requests = 0
-    state.user_request_count = {user_id: 0}
-    state.total_response_time = 0.0
-    
-    mock_update = MagicMock()
-    mock_update.message.content = "test message"
-    mock_update.message.reply_text = AsyncMock()
-    mock_update.effective_user.id = user_id
-    mock_update.effective_chat.type = "private"
-    
-    mock_context = MagicMock()
-    mock_context.application.bot_data = {"state": state}
-    
-    # Patch complete_with_usage to raise HTTPClientError
-    with patch('telegram_chat_bot.complete_with_usage', side_effect=HTTPClientError("HTTP 400: Bad Request")), \
-         patch.object(state, 'persist', return_value=None):
-        asyncio.run(handle_message(mock_update, mock_context))
-    
-    # History should be empty (user message popped as rollback)
-    assert len(state.history[user_id]) == 0
-    # Failed requests incremented
-    assert state.failed_requests >= 1
-    # Message sent
-    assert mock_update.message.reply_text.called
-
-
-
-def test_handle_message_catches_http_client_error():
-    """Verify handle_message catches HTTPClientError and pops history."""
-    settings = Settings(token='test', allowed_user_ids={789})
-    state = State(settings)
-    user_id = 789
-    state.history[user_id] = []
-    state.successful_requests = 0
-    state.failed_requests = 0
-    state.request_semaphore = asyncio.Semaphore(1)
-    state.usage = MagicMock()
-    state.usage.reserve_request = MagicMock(return_value=(True, 100, 100))
-    state.total_requests = 0
-    state.user_request_count = {user_id: 0}
-    state.total_response_time = 0.0
-    
-    mock_update = MagicMock()
-    mock_update.message.content = "test message"
-    mock_update.message.reply_text = AsyncMock()
-    mock_update.effective_user.id = user_id
-    mock_update.effective_chat.type = "private"
-    
-    mock_context = MagicMock()
-    mock_context.application.bot_data = {"state": state}
-    
-    # Patch complete_with_usage to raise HTTPClientError
-    with patch('telegram_chat_bot.complete_with_usage', side_effect=HTTPClientError("HTTP 400: Bad Request")), \
-         patch.object(state, 'persist', return_value=None):
-        asyncio.run(handle_message(mock_update, mock_context))
-    
-    # History should be empty (user message popped as rollback)
-    assert len(state.history[user_id]) == 0
-    # Failed requests incremented
-    assert state.failed_requests >= 1
-    # Message sent
-    assert mock_update.message.reply_text.called
-
-
-
-def test_handle_message_catches_http_client_error():
-    """Verify handle_message catches HTTPClientError and pops history."""
-    settings = Settings(token='test', allowed_user_ids={789})
-    state = State(settings)
-    user_id = 789
-    state.history[user_id] = []
-    state.successful_requests = 0
-    state.failed_requests = 0
-    state.request_semaphore = asyncio.Semaphore(1)
-    state.usage = MagicMock()
-    state.usage.reserve_request = MagicMock(return_value=(True, 100, 100))
-    state.total_requests = 0
-    state.user_request_count = {user_id: 0}
-    state.total_response_time = 0.0
-    
-    mock_update = MagicMock()
-    mock_update.message.content = "test message"
-    mock_update.message.reply_text = AsyncMock()
-    mock_update.effective_user.id = user_id
-    mock_update.effective_chat.type = "private"
-    
-    mock_context = MagicMock()
-    mock_context.application.bot_data = {"state": state}
-    
-    # Patch complete_with_usage to raise HTTPClientError
-    with patch('telegram_chat_bot.complete_with_usage', side_effect=HTTPClientError("HTTP 400: Bad Request")), \
-         patch.object(state, 'persist', return_value=None):
-        asyncio.run(handle_message(mock_update, mock_context))
-    
-    # History should be empty (user message popped as rollback)
-    assert len(state.history[user_id]) == 0
-    # Failed requests incremented
-    assert state.failed_requests >= 1
-    # Message sent
-    assert mock_update.message.reply_text.called
-
-
-
-def test_handle_message_catches_http_client_error():
-    """Verify handle_message catches HTTPClientError and pops history."""
-    settings = Settings(token='test', allowed_user_ids={789})
-    state = State(settings)
-    user_id = 789
-    state.history[user_id] = []
-    state.successful_requests = 0
-    state.failed_requests = 0
-    state.request_semaphore = asyncio.Semaphore(1)
-    state.usage = MagicMock()
-    state.usage.reserve_request = MagicMock(return_value=(True, 100, 100))
-    state.total_requests = 0
-    state.user_request_count = {user_id: 0}
-    state.total_response_time = 0.0
-    
-    mock_update = MagicMock()
-    mock_update.message.content = "test message"
-    mock_update.message.reply_text = AsyncMock()
-    mock_update.effective_user.id = user_id
-    mock_update.effective_chat.type = "private"
-    
-    mock_context = MagicMock()
-    mock_context.application.bot_data = {"state": state}
-    
-    # Patch complete_with_usage to raise HTTPClientError
-    with patch('telegram_chat_bot.complete_with_usage', side_effect=HTTPClientError("HTTP 400: Bad Request")), \
-         patch.object(state, 'persist', return_value=None):
-        asyncio.run(handle_message(mock_update, mock_context))
-    
-    # History should be empty (user message popped as rollback)
-    assert len(state.history[user_id]) == 0
-    # Failed requests incremented
-    assert state.failed_requests >= 1
-    # Message sent
-    assert mock_update.message.reply_text.called
-
 
 
 def test_handle_message_catches_http_client_error():
