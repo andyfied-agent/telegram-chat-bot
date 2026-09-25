@@ -1,0 +1,103 @@
+# Group Chat Support Design
+
+## Overview
+Extend the Telegram bot to optionally handle messages in allowed groups, with per-group permissions and @mention prefix support.
+
+## Requirements
+
+### Environment Variables
+- `TELEGRAM_ALLOWED_GROUP_IDS` - Comma-separated group chat IDs (optional, empty = group chat disabled)
+- `TELEGRAM_ADMIN_GROUP_IDS` - Comma-separated group IDs that can use admin commands (optional, empty = no group admin commands)
+
+### Features
+1. **Group message filtering**: Only process messages from allowed groups
+2. **@mention prefix**: In group chats, require @botusername prefix to trigger responses (unless configured otherwise)
+3. **Per-group state**: Conversation history and usage counters per (user, group) pair
+4. **Group-specific registration**: Groups need approval before the bot can respond in them
+5. **Admin commands**: Only `TELEGRAM_ADMIN_USER_IDS` + `TELEGRAM_ADMIN_GROUP_IDS` users can manage group permissions
+
+### Security Considerations
+- Group chats are inherently less secure than private messages
+- No direct messages to the bot in groups (must use @mention)
+- Admin commands in groups require explicit admin user ID validation
+
+## Architecture Changes
+
+### Data Model
+```python
+class State:
+    # Current: user_id -> list[dict]
+    # New: (user_id, group_id) -> list[dict]  # group_id = None for private
+    
+    def get_history(self, user_id: int, group_id: Optional[int] = None) -> List[dict]
+    def append_history(self, user_id: int, message: dict, group_id: Optional[int] = None) -> None
+    def clear_history(self, user_id: int, group_id: Optional[int] = None) -> None
+```
+
+### Message Handler
+```python
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Determine if group or private
+    group_id = update.effective_message.chat.id if update.effective_message.chat.type == Chat.GROUP else None
+    
+    # Check if group is allowed (skip if private)
+    if group_id and group_id not in get_allowed_groups():
+        return  # Silent ignore
+    
+    # Check @mention requirement for groups
+    if group_id and not has_mention_prefix(update.effective_message, bot_username):
+        return  # Silent ignore in groups
+    
+    # Rest of handler unchanged (allows, rate limiting, etc.)
+```
+
+### Group Registration Flow
+1. User sends `/startgroup` in a group chat
+2. Bot creates pending group registration (stored in `registrations.json` with group ID)
+3. Admin approves via `/approvegroup <group_id>`
+4. Bot starts responding in that group
+
+### Commands (Group Context)
+- `/startgroup` - Request to join a group
+- `/approvegroup <group_id>` - Admin approves group
+- `/rejectgroup <group_id>` - Admin rejects group
+- `/revokegroup <group_id>` - Remove group access
+- `/groupusers` - List groups bot is in
+- `/groupstatus <group_id>` - Show group-specific stats
+
+## Implementation Plan
+
+### Phase 1: Core Support
+1. Update `State` class to handle (user_id, group_id) tuples
+2. Add `TELEGRAM_ALLOWED_GROUP_IDS` validation
+3. Modify `handle_message` to check group allowlist
+4. Add @mention prefix detection for groups
+
+### Phase 2: Registration System
+1. Extend `RegistrationStore` to handle group IDs
+2. Add `/startgroup` handler
+3. Add `/approvegroup`, `/rejectgroup`, `/revokegroup` handlers
+4. Update `/users` to show group registrations
+
+### Phase 3: Admin Commands
+1. Add group admin command handlers (`/groupusers`, `/groupstatus`)
+2. Implement per-group usage statistics
+3. Add @mention prefix enforcement option
+
+### Phase 4: Testing
+1. Mock group chat messages in tests
+2. Test group allowlist filtering
+3. Test @mention prefix detection
+4. Test group registration workflow
+
+## Open Questions
+
+1. Should @mention be mandatory in groups? (default: yes)
+2. Should the bot respond to @all/@everyone mentions? (default: no for security)
+3. How to handle group admins vs bot admin permissions?
+4. Should groups have separate rate limits from private messages?
+
+## Related Files
+- `telegram_chat_bot.py` - Main bot logic
+- `tests/test_bot.py` - Existing bot tests
+- `tests/` - New test files for group chat functionality
