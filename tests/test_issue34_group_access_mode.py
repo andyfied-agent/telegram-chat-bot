@@ -1,7 +1,5 @@
 """Tests for Issue #34: GROUP_ACCESS_MODE validation and enforcement."""
 import pytest
-from telegram import Update, Chat, User
-from telegram.ext import ContextTypes
 
 from telegram_chat_bot import State, Settings
 

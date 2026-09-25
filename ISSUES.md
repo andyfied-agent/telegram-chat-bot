@@ -122,11 +122,11 @@ The following GitHub issues have been addressed:
 |||| Low Priority | 9 | 9 | 0 |
 |||| **Total** | **14** | **14** | **0** |
 
-**Test Coverage:** 184 tests passing (180 from main + 4 new tests for group functionality, 4 failing - see PR #44 notes)
+**Test Coverage:** 180 tests passing (184 pytest tests run, 4 test fixes in progress)
 
 **Next Action:** All tracked issues complete. PR #44 ready for CI review (180/184 tests passing, 4 known test fixes in progress).
 
 ---
 
 **Last updated:** 2026-09-25
-**Bot version:** Latest (all 115 tests pass, service running)
+**Bot version:** Latest (180/184 tests passing, Ruff clean)

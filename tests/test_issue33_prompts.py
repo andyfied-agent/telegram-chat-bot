@@ -1,10 +1,6 @@
 """Tests for Issue #33: Private prompts isolation in group chats."""
-import pytest
-from unittest.mock import MagicMock
-from telegram import Update, Chat, User
-from telegram.ext import ContextTypes
 
-from telegram_chat_bot import State, Settings, _state_key
+from telegram_chat_bot import State, Settings
 
 
 class TestPrivatePromptsIsolation:

@@ -1318,8 +1318,6 @@ async def setgroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Only administrators can set group prompts.")
         return
     
-    chat_type = update.effective_chat.type
-    
     # Always expect: /setgroupprompt <group_id> <prompt>
     if not context.args:
         await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
@@ -1405,8 +1403,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /setgroupprompt <text> /showgroupprompt /cleargroupprompt /shutdown /help\n\n"
-        "Group commands (admin only): /startgroup <id> /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
+        "Commands:\n"
+        "/start - Request access or check status\n"
+        "/approve <id> - Approve a user (admin only)\n"
+        "/reject <id> - Reject a user (admin only)\n"
+        "/revoke <id> - Revoke user access (admin only)\n"
+        "/users - List all registrations\n"
+        "/status - Show model and history info\n"
+        "/metrics - Show request statistics\n"
+        "/ratelimit - Show rate limit status\n"
+        "/usage - Show daily usage\n"
+        "/resilience - Show resilience/circuit breaker status\n"
+        "/reset - Clear conversation history\n"
+        "/history - Show message count\n"
+        "/addglobalprompt <text> - Set global system prompt (admin only)\n"
+        "/addprivateprompt <user_id> <text> - Set per-user private prompt (admin only)\n"
+        "/setgroupprompt <group_id> <text> - Set group-specific prompt (admin only)\n"
+        "/showgroupprompt <group_id> - Show group prompt (admin only)\n"
+        "/cleargroupprompt <group_id> - Clear group prompt (admin only)\n"
+        "/shutdown - Shutdown the bot (local only)\n"
+        "/help - Show this message\n"
+        "\n"
+        "Group commands (work in groups):\n"
+        "/reset - Clear group conversation history\n"
+        "/history - Show message count in group\n"
     )
 
 
@@ -1660,9 +1680,10 @@ async def main() -> None:
     app = Application.builder().token(token).build()
     app.bot_data["state"] = State(settings)
     # Load persisted state on startup
+    await app.initialize()  # Must initialize before set_my_commands
     app.bot_data["state"]._load()
     
-    # Set up Telegram native command menu (async)
+    # Set up Telegram native command menu (async) - after app.initialize()
     commands = [
         BotCommand("start", "Request access or check your status"),
         BotCommand("approve", "Approve a user (admin only)"),
@@ -1686,16 +1707,16 @@ async def main() -> None:
     ]
     # Register commands for private chats
     await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-    # Register group-specific commands
+    # Register group-specific commands - only expose commands that work in groups
     group_commands = [
-        BotCommand("startgroup", "Request to add bot to a group (admin only)"),
-        BotCommand("approvegroup", "Approve a group (admin only)"),
-        BotCommand("rejectgroup", "Reject a group (admin only)"),
-        BotCommand("revokegroup", "Revoke group access (admin only)"),
-        BotCommand("groupusers", "List approved groups (admin only)"),
+        BotCommand("reset", "Clear group conversation history"),
+        BotCommand("history", "Show message count in group"),
+        BotCommand("setgroupprompt", "Set group-specific prompt (admin only)"),
+        BotCommand("showgroupprompt", "Show group prompt (admin only)"),
+        BotCommand("cleargroupprompt", "Clear group prompt (admin only)"),
+        BotCommand("help", "Show all available commands"),
     ]
     await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
-    await app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllChatAdministrators())
     
     only_private = private()
     # Private-only commands (admin/user)

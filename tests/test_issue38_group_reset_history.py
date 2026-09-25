@@ -1,8 +1,6 @@
 """Tests for Issue #38: Group /reset and /history reachability."""
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from telegram import Update, Chat, User
-from telegram.ext import ContextTypes
+from unittest.mock import AsyncMock, MagicMock
 
 from telegram_chat_bot import State, Settings
 
