@@ -48,7 +48,9 @@ def _init_logging() -> None:
     if _file_handler is not None:
         return  # Already initialized
     
-    _log_dir = Path("/mnt/scratch/hermes/logs")
+    # Configurable log directory via environment variable, defaults to /mnt/scratch/hermes/logs
+    log_dir_str = os.getenv("TELEGRAM_BOT_LOG_DIR", "/mnt/scratch/hermes/logs")
+    _log_dir = Path(log_dir_str)
     try:
         _log_dir.mkdir(parents=True, exist_ok=True)
         log_file = _log_dir / "telegram-chat-bot.log"

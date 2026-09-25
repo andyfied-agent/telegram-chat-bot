@@ -57,6 +57,7 @@ Set the following environment variables (documented in .env.example):
 - MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000. Response chunks are capped at 4096 characters (Telegram API limit).
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 - MAX_CONCURRENT_REQUESTS -- Maximum concurrent model requests allowed. Default: 2. Set to 1 for strict serialization.
+- TELEGRAM_BOT_LOG_DIR -- Log directory for rotating file handler. Default: /mnt/scratch/hermes/logs.
 
 ## Numeric Setting Validation
 
