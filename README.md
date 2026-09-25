@@ -221,3 +221,12 @@ python -m pytest tests/test_bot.py -v
 ## License
 
 MIT
+## Fixes Summary
+
+This PR fixes three critical issues:
+
+1. History consistency race under concurrent requests
+2. Circuit breaker failure count never resetting  
+3. Circuit breaker thread safety
+
+See commit 522348e for details.
