@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Load .env file if it exists (prior to any os.getenv calls)
@@ -1550,7 +1550,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
             logger.exception("llama.cpp request failed for user %s", user_id)
             await state.persist()
-            await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
+            # Provide more helpful error messages based on error type
+            error_type = type(sys.exc_info()[1]).__name__
+            if "timeout" in str(sys.exc_info()[1]).lower() or "timed out" in str(sys.exc_info()[1]).lower():
+                await update.message.reply_text("The model request timed out. The server may be busy. Please try again in a moment.")
+            elif isinstance(sys.exc_info()[1], HTTPClientError):
+                await update.message.reply_text("The model server returned an error. An administrator has been notified. Please try again shortly.")
+            else:
+                await update.message.reply_text("The model request failed. An administrator has been notified. Please try again shortly.")
             return
         state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
         state.history[user_id].append({"role": "assistant", "content": result.text})
@@ -1628,7 +1635,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
             logger.exception("llama.cpp request failed for user %s in group %s", user_id, group_id)
             await state.persist()
-            await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
+            # Provide more helpful error messages based on error type
+            if "timeout" in str(sys.exc_info()[1]).lower() or "timed out" in str(sys.exc_info()[1]).lower():
+                await update.message.reply_text("The model request timed out. The server may be busy. Please try again in a moment.")
+            elif isinstance(sys.exc_info()[1], HTTPClientError):
+                await update.message.reply_text("The model server returned an error. An administrator has been notified. Please try again shortly.")
+            else:
+                await update.message.reply_text("The model request failed. An administrator has been notified. Please try again shortly.")
             return
         state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
         state.history[(user_id, group_id)].append({"role": "assistant", "content": result.text})
@@ -1649,6 +1662,42 @@ def main() -> None:
     app.bot_data["state"] = State(settings)
     # Load persisted state on startup
     app.bot_data["state"]._load()
+    
+    # Set up Telegram native command menu (async)
+    commands = [
+        BotCommand("start", "Request access or check your status"),
+        BotCommand("approve", "Approve a user (admin only)"),
+        BotCommand("reject", "Reject a user (admin only)"),
+        BotCommand("revoke", "Revoke user access (admin only)"),
+        BotCommand("users", "List registrations (admin only)"),
+        BotCommand("status", "Show model and history info"),
+        BotCommand("metrics", "Show request statistics"),
+        BotCommand("ratelimit", "Show rate limit status"),
+        BotCommand("usage", "Show daily usage"),
+        BotCommand("resilience", "Show resilience/circuit breaker status"),
+        BotCommand("reset", "Clear conversation history"),
+        BotCommand("history", "Show message count in memory"),
+        BotCommand("addglobalprompt", "Set global system prompt (admin only)"),
+        BotCommand("addprivateprompt", "Set per-user private prompt"),
+        BotCommand("setgroupprompt", "Set group-specific prompt (admin only)"),
+        BotCommand("showgroupprompt", "Show group prompt (admin only)"),
+        BotCommand("cleargroupprompt", "Clear group prompt (admin only)"),
+        BotCommand("shutdown", "Shutdown the bot (local only)"),
+        BotCommand("help", "Show all available commands"),
+    ]
+    # Register commands for private chats
+    app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    # Register group-specific commands
+    group_commands = [
+        BotCommand("startgroup", "Request to add bot to a group (admin only)"),
+        BotCommand("approvegroup", "Approve a group (admin only)"),
+        BotCommand("rejectgroup", "Reject a group (admin only)"),
+        BotCommand("revokegroup", "Revoke group access (admin only)"),
+        BotCommand("groupusers", "List approved groups (admin only)"),
+    ]
+    app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
+    app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllChatAdministrators())
+    
     only_private = private()
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,

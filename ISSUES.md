@@ -84,6 +84,20 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Flexible group authorization policies.  
 **Implementation:** ✅ Complete - Added `group_access_mode` setting and updated authorization logic.
 
+### 41. Improve User-Facing Error Messages
+**Status:** Complete  
+**Description:** Generic error messages don't help users understand what went wrong.  
+**Solution:** Provide specific messages for timeouts vs server errors vs other failures.  
+**Impact:** Better user experience and troubleshooting.  
+**Implementation:** ✅ Complete - Added differentiated messages for timeout, HTTP error, and general failures.
+
+### 39. Telegram Native Command Menu
+**Status:** Complete  
+**Description:** Users can't see available commands without typing `/`.  
+**Solution:** Register `BotCommand` menu with scopes for private chats, group chats, and admins.  
+**Impact:** Discoverability of bot features.  
+**Implementation:** ✅ Complete - Registered command menus with descriptions for all scopes.
+
 ---
 
 ## Resolved Issues
@@ -105,12 +119,12 @@ The following GitHub issues have been addressed:
 ||||----------|-------|----------|-----------|
 |||| High Priority | 1 | 1 | 0 |
 |||| Medium Priority | 4 | 4 | 0 |
-|||| Low Priority | 7 | 7 | 0 |
-|||| **Total** | **12** | **12** | **0** |
+|||| Low Priority | 9 | 9 | 0 |
+|||| **Total** | **14** | **14** | **0** |
 
 **Test Coverage:** 115 tests passing (100 from main + 15 new tests for concurrent limiting, rate-limit visibility, and logging)
 
-**Next Action:** Issue #41 (Improve user-facing model and provider error messages) - minor UX enhancement.
+**Next Action:** All tracked issues complete. Ready for release.
 
 ---
 
