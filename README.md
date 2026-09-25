@@ -284,6 +284,8 @@ The service unit telegram-chat-bot.service.example can be deployed as a user ser
 
 The unit uses systemd StateDirectory to create the persistent state directory before startup. Both `TELEGRAM_REGISTRATION_FILE` and `TELEGRAM_CHAT_BOT_STATE_FILE` point into `%S/telegram-chat-bot`, which remains writable despite `ProtectHome=read-only` and `ProtectSystem=strict`. The service runs as a simple service and restarts on failure after 5 seconds.
 
+The default state path follows the XDG user-state convention at `~/.local/state/telegram-chat-bot/state.json`. The legacy `~/.telegram-chat-bot/state.json` path is read only during migration and is never used for new writes.
+
 ## Development
 
 source .venv/bin/activate

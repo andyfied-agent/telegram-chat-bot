@@ -987,10 +987,10 @@ class TestPersistentState:
     """Tests for issue #11: persistent conversation state."""
 
     def test_settings_state_file_default(self):
-        """Default state_file points to ~/.telegram-chat-bot/state.json."""
-        with patch("os.path.expanduser", return_value="/home/test/.telegram-chat-bot/state.json"):
+        """Default state_file follows the XDG user-state location."""
+        with patch("os.path.expanduser", return_value="/home/test/.local/state/telegram-chat-bot/state.json"):
             settings = Settings(token='test')
-        assert settings.state_file == "/home/test/.telegram-chat-bot/state.json"
+        assert settings.state_file == "/home/test/.local/state/telegram-chat-bot/state.json"
 
     def test_settings_custom_state_file(self):
         """Custom state_file can be set via environment variable."""
@@ -1230,6 +1230,21 @@ class TestPersistentState:
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+
+    def test_state_load_migrates_legacy_path(self, tmp_path):
+        """Legacy state is read when the XDG state file is absent."""
+        legacy_path = tmp_path / "legacy" / "state.json"
+        state_path = tmp_path / "xdg" / "state.json"
+        legacy_path.parent.mkdir()
+        legacy_path.write_text(json.dumps({"global_prompt": "legacy prompt"}))
+        settings = Settings(token="test", state_file=str(state_path), legacy_state_file=str(legacy_path))
+        state = State(settings)
+        state._load()
+        assert state.global_prompt == "legacy prompt"
+        state._dump()
+        assert state_path.exists()
+        assert legacy_path.exists()
 
 
 # ---- Numeric setting validation tests for new settings ----

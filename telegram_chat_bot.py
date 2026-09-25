@@ -424,7 +424,9 @@ class Settings:
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
     ))
-    state_file: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_BOT_STATE_FILE", os.path.expanduser("~/.telegram-chat-bot/state.json")))
+    state_file: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_BOT_STATE_FILE", os.path.expanduser("~/.local/state/telegram-chat-bot/state.json")))
+    # Read-only compatibility source for pre-XDG installations; new writes use state_file.
+    legacy_state_file: str = field(default_factory=lambda: os.path.expanduser("~/.telegram-chat-bot/state.json"))
     max_history: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("TELEGRAM_CHAT_BOT_MAX_HISTORY", "100"), "TELEGRAM_CHAT_BOT_MAX_HISTORY"))
     provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "llama.cpp"))
     default_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("DEFAULT_DAILY_REQUEST_LIMIT", "0"), "DEFAULT_DAILY_REQUEST_LIMIT"))
@@ -820,7 +822,12 @@ class State:
         """Load state from file on disk."""
         if self._persisted:
             return
-        data = _read_state(self.settings.state_file)
+        state_path = Path(self.settings.state_file)
+        data = _read_state(str(state_path))
+        legacy_path = Path(self.settings.legacy_state_file)
+        if not state_path.exists() and legacy_path.is_file():
+            # Read the pre-XDG location once; future writes go to the XDG path.
+            data = _read_state(str(legacy_path))
         self.global_prompt = data.get("global_prompt", "")
         self.private_prompts = {int(k): v for k, v in data.get("private_prompts", {}).items()}
         self.group_prompts = {int(k): v for k, v in data.get("group_prompts", {}).items()}
