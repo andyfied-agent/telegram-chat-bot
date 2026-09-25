@@ -47,6 +47,14 @@ echo "Upgrading pip..."
 echo "Installing dependencies..."
 .venv/bin/python3 -m pip install -r requirements.lock
 
+echo "Preserving .env file if it exists (user secrets)..."
+if [ -f .env ]; then
+    echo "Existing .env file preserved."
+elif [ -f .env.example ]; then
+    echo "Creating new .env file from .env.example (update with your TELEGRAM_TOKEN)..."
+    cp .env.example .env
+fi
+
 echo "Creating log directory..."
 # Default to user state directory (portable), override with /mnt/scratch/hermes/logs on compute01
 log_dir="${TELEGRAM_BOT_LOG_DIR:-~/.local/state/telegram-chat-bot/logs}"

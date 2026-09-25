@@ -1,4 +1,20 @@
+# Virtual environment
 .venv/
 __pycache__/
-*.py[cod]
+
+# Test/cache
+.pytest_cache/
+.ruff_cache/
+
+# Environment files (user secrets - never commit)
 .env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
