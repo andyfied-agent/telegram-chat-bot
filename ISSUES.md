@@ -56,6 +56,13 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Data durability and recovery.  
 **Implementation:** ✅ Complete - Daily backups with rotation policy.
 
+### 38. Group Context Management
+**Status:** Complete  
+**Description:** Group-specific history exists, but `/history` and `/reset` are private-only.  
+**Solution:** Extend `/history` and `/reset` to work in groups with per-user context.  
+**Impact:** Users can inspect and reset their group conversation history.  
+**Implementation:** ✅ Complete - Commands now support group context with proper authorization.
+
 ### 8. Group Chat Registration System
 **Status:** Complete  
 **Description:** Groups need their own registration/approval system.  
@@ -80,12 +87,12 @@ The following GitHub issues have been addressed:
 
 ## Current Status Summary
 
-|| Category | Total | Complete | Remaining |
-||----------|-------|----------|-----------|
-|| High Priority | 1 | 1 | 0 |
-|| Medium Priority | 4 | 4 | 0 |
-|| Low Priority | 4 | 3 | 1 |
-|| **Total** | **9** | **8** | **1** |
+||| Category | Total | Complete | Remaining |
+|||----------|-------|----------|-----------|
+||| High Priority | 1 | 1 | 0 |
+||| Medium Priority | 4 | 4 | 0 |
+||| Low Priority | 5 | 5 | 0 |
+||| **Total** | **10** | **10** | **0** |
 
 **Test Coverage:** 115 tests passing (100 from main + 15 new tests for concurrent limiting, rate-limit visibility, and logging)
 

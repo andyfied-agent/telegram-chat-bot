@@ -1183,17 +1183,53 @@ async def ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
-    if not state.allowed(update.effective_user.id):
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    
+    # Determine group_id if in a group
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
+    
+    # Check authorization based on chat type
+    if chat_type == "private":
+        if not state.allowed(user_id):
+            return
+    elif group_id:
+        if not state.allowed_group(group_id):
+            return
+    else:
         return
-    await state.reset(update.effective_user.id)
-    await update.message.reply_text("Your conversation context has been reset.")
+    
+    await state.reset(user_id, group_id)
+    if group_id:
+        await update.message.reply_text("Your conversation context for this group has been reset.")
+    else:
+        await update.message.reply_text("Your conversation context has been reset.")
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
-    if not state.allowed(update.effective_user.id):
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    
+    # Determine group_id if in a group
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
+    
+    # Check authorization based on chat type
+    if chat_type == "private":
+        if not state.allowed(user_id):
+            return
+    elif group_id:
+        if not state.allowed_group(group_id):
+            return
+    else:
         return
-    await update.message.reply_text(f"I retain {len(state.history[update.effective_user.id])} recent messages in memory for this chat.")
+    
+    key = _state_key(user_id, group_id)
+    history_count = len(state.history.get(key, []))
+    if group_id:
+        await update.message.reply_text(f"I retain {history_count} recent messages in memory for this group chat.")
+    else:
+        await update.message.reply_text(f"I retain {history_count} recent messages in memory for this chat.")
 
 
 async def addglobalprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
