@@ -1,12 +1,9 @@
 """Group registration tests for Phase 2."""
-import json
 import tempfile
 from pathlib import Path
 
 import pytest
-from telegram import Chat, User
-
-from telegram_chat_bot import RegistrationStore, State
+from telegram_chat_bot import RegistrationStore
 
 
 class TestGroupRegistrationStore:
@@ -35,6 +32,19 @@ class TestGroupRegistrationStore:
             store.set_status(12345, "pending")
             assert store.status(12345) == "pending"
             assert store.users("pending") == [12345]
+        finally:
+            Path(path).unlink(missing_ok=True)
+    
+    def test_group_registration_store_handles_negative_group_ids(self):
+        """Negative group IDs (Telegram style) work correctly."""
+        with tempfile.NamedTemporaryFile(delete=False, mode='w') as f:
+            f.write("{}\n")
+            path = f.name
+        try:
+            store = RegistrationStore(path, group=True)
+            store.set_status(-100, "pending")
+            assert store.status(-100) == "pending"
+            assert -100 in store.users("pending")
         finally:
             Path(path).unlink(missing_ok=True)
     
@@ -79,18 +89,5 @@ class TestGroupRegistrationStore:
             store = RegistrationStore(path, group=True)
             with pytest.raises(ValueError, match="invalid registration status"):
                 store.set_status(99999, "invalid")
-        finally:
-            Path(path).unlink(missing_ok=True)
-    
-    def test_group_registration_store_handles_group_ids(self):
-        """Group IDs (negative numbers) work correctly."""
-        with tempfile.NamedTemporaryFile(delete=False, mode='w') as f:
-            f.write("{}\n")
-            path = f.name
-        try:
-            store = RegistrationStore(path, group=True)
-            store.set_status(-100, "pending")
-            assert store.status(-100) == "pending"
-            assert -100 in store.users("pending")
         finally:
             Path(path).unlink(missing_ok=True)

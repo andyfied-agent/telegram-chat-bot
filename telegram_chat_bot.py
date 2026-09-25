@@ -22,9 +22,8 @@ from enum import Enum
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.helpers import escape_markdown
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -98,7 +97,6 @@ def get_provider_failures() -> list[ProviderFailure]:
 
 class ProviderTimeoutError(RuntimeError):
     """Raised when the bounded provider request exceeds its timeout."""
-
 
 
 
@@ -289,9 +287,62 @@ def _parse_provider_limits(value: str) -> dict[str, int]:
 _state_lock = asyncio.Lock()
 
 
-def has_mention_botname(message_text: str, bot_username: str) -> bool:
-    """Check if message contains @<bot_username> mention."""
-    return f"@{bot_username}" in message_text
+def remove_bot_mention(update_message, bot_username: str) -> str:
+    """Remove the bot mention from message text using entity-aware parsing.
+    
+    Uses parse_entity to properly handle UTF-16 code unit offsets,
+    avoiding issues with emoji/non-BMP characters before the mention.
+    
+    Args:
+        update_message: Telegram message object with entities
+        bot_username: The bot's username (without @)
+    
+    Returns:
+        Message text with the bot mention removed.
+    """
+    if not update_message.entities:
+        return update_message.text
+    
+    text = update_message.text
+    # Find all entities that match the bot mention
+    for entity in update_message.entities:
+        mention_text = update_message.parse_entity(entity)
+        if mention_text and mention_text.lower() == f"@{bot_username}".lower():
+            # Remove the mention and strip
+            return text.replace(mention_text, "").strip()
+    
+    return text
+
+
+def has_mention_botname(update_message, bot_username: str) -> bool:
+    """Check if message contains an actual @<bot_username> mention using Telegram entities.
+    
+    Args:
+        update_message: The message object from Telegram update
+        bot_username: The bot's username (without @)
+    
+    Returns:
+        True if message contains an actual mention of this bot, False otherwise.
+        Uses Telegram's message entities for accurate detection.
+    """
+    if not update_message.entities:
+        return False
+    
+    # Telegram entities are case-sensitive, so we need to match exactly
+    # but we'll also check case-insensitively for robustness
+    for entity in update_message.entities:
+        if entity.type == "mention":
+            # Use parse_entity to properly handle UTF-16 code unit offsets
+            mentioned_user = update_message.parse_entity(entity)
+            if mentioned_user and mentioned_user.lstrip("@").lower() == bot_username.lower():
+                return True
+        elif entity.type == "bot_command":
+            # Bot commands like @botname command are also mentions
+            command_text = update_message.parse_entity(entity)
+            if command_text and command_text.lower() == f"@{bot_username}".lower():
+                return True
+    
+    return False
 
 
 def _state_key(user_id: int, group_id: int | None = None) -> int | tuple[int, int]:
@@ -357,9 +408,6 @@ class Settings:
     allowed_group_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_GROUP_IDS", "").split(",") if value.strip()
     ))
-    admin_group_ids: frozenset[int] = field(default_factory=lambda: frozenset(
-        int(value.strip()) for value in os.getenv("TELEGRAM_ADMIN_GROUP_IDS", "").split(",") if value.strip()
-    ))
     request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
@@ -419,7 +467,7 @@ class RegistrationStore:
         """Return list of registered users/groups, optionally filtered by status."""
         return sorted(int(user_id) for user_id, value in self._users.items() 
                      if status is None or value == status)
-
+    
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
@@ -735,7 +783,9 @@ class State:
         self.private_prompts: dict[int, str] = {}
         self.last_request: dict[int, float] = {}
         self.request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
-        self.registrations = RegistrationStore(settings.registration_file)
+        # Separate registration stores for users and groups
+        self.user_registrations = RegistrationStore(settings.registration_file, group=False)
+        self.group_registrations = RegistrationStore(str(Path(settings.registration_file).with_name("group_registrations.json")), group=True)
         self.usage = UsageState(settings)
         self._persisted = False
         
@@ -810,12 +860,17 @@ class State:
         await self.persist()
 
     def allowed(self, user_id: int) -> bool:
-        return user_id in self.settings.allowed_user_ids or self.registrations.status(user_id) == "approved"
+        return user_id in self.settings.allowed_user_ids or self.user_registrations.status(user_id) == "approved"
     
     def allowed_group(self, group_id: int) -> bool:
-        """Check if group is in the allowed group allowlist."""
-        return group_id in self.settings.allowed_group_ids
-
+        """Check if group is allowed via TELEGRAM_ALLOWED_GROUP_IDS OR approved registration."""
+        # Check both static allowlist and registration store
+        if group_id in self.settings.allowed_group_ids:
+            return True
+        if self.group_registrations.status(group_id) == "approved":
+            return True
+        return False
+    
     def admin(self, user_id: int) -> bool:
         return user_id in self.settings.admin_user_ids
 
@@ -846,14 +901,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if state.allowed(user_id):
         await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
         return
-    registration_status = state.registrations.status(user_id)
+    registration_status = state.user_registrations.status(user_id)
     if registration_status == "pending":
         await update.message.reply_text("Your access request is still pending administrator approval.")
         return
     if registration_status == "rejected":
         await update.message.reply_text("Your access request was rejected by an administrator.")
         return
-    state.registrations.set_status(user_id, "pending")
+    state.user_registrations.set_status(user_id, "pending")
     await update.message.reply_text("Your access request was recorded and is pending administrator approval.")
 
 
@@ -866,7 +921,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /approve <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "approved")
+    state.user_registrations.set_status(user_id, "approved")
     await update.message.reply_text(f"User {user_id} approved.")
 
 
@@ -879,7 +934,7 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /reject <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "rejected")
+    state.user_registrations.set_status(user_id, "rejected")
     await update.message.reply_text(f"User {user_id} rejected.")
 
 
@@ -892,7 +947,7 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /revoke <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "rejected")
+    state.user_registrations.set_status(user_id, "rejected")
     await update.message.reply_text(f"User {user_id} revoked.")
 
 
@@ -902,93 +957,120 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Only administrators can list users.")
         return
     
-    pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
-    approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
+    pending = ", ".join(map(str, state.user_registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.user_registrations.users("approved"))) or "none"
     await update.message.reply_text(f"Pending: {pending}\nApproved: {approved}")
 
 
-# Group registration commands (Phase 2)
+# Group registration commands (Phase 2) - all private commands used by admins
 async def startgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Request to add bot to a group."""
+    """Request to add bot to a group. Admins use this command privately."""
     state: State = context.application.bot_data["state"]
     
-    # Get group ID from the message context (not from args)
-    if not update.effective_chat or update.effective_chat.type != "group":
-        await update.message.reply_text("This command can only be used in a group chat.")
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can register groups.")
         return
     
-    group_id = update.effective_chat.id
+    # Get group ID from command argument (negative group ID)
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /startgroup <telegram_group_id>")
+        return
     
-    # Ignore any arguments - always register the actual group
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    # Telegram group IDs are negative, so this is valid
+    state.group_registrations.set_status(group_id, "pending")
     await update.message.reply_text(
         f"Group {group_id} registration request created. "
-        f"An administrator must approve it before the bot can respond."
+        f"Once approved, the bot will respond to @botname mentions in this group."
     )
-    state.registrations.set_status(group_id, "pending")
 
 
 async def approvegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Approve a group registration."""
+    """Approve a group registration. Used by admins in private messages."""
     state: State = context.application.bot_data["state"]
     
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can approve groups.")
         return
     
-    if len(context.args) != 1 or not context.args[0].isdigit():
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /approvegroup <telegram_group_id>")
         return
     
-    group_id = int(context.args[0])
-    state.registrations.set_status(group_id, "approved")
-    await update.message.reply_text(f"Group {group_id} approved.")
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "approved")
+    await update.message.reply_text(f"Group {group_id} approved. The bot will now respond in this group.")
 
 
 async def rejectgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reject a group registration."""
+    """Reject a group registration. Used by admins in private messages."""
     state: State = context.application.bot_data["state"]
     
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can reject groups.")
         return
     
-    if len(context.args) != 1 or not context.args[0].isdigit():
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /rejectgroup <telegram_group_id>")
         return
     
-    group_id = int(context.args[0])
-    state.registrations.set_status(group_id, "rejected")
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "rejected")
     await update.message.reply_text(f"Group {group_id} rejected.")
 
 
 async def revokegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Revoke access for a group."""
+    """Revoke access for a group. Used by admins in private messages."""
     state: State = context.application.bot_data["state"]
     
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can revoke groups.")
         return
     
-    if len(context.args) != 1 or not context.args[0].isdigit():
+    if len(context.args) != 1:
         await update.message.reply_text("Usage: /revokegroup <telegram_group_id>")
         return
     
-    group_id = int(context.args[0])
-    state.registrations.set_status(group_id, "rejected")
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "rejected")
     await update.message.reply_text(f"Group {group_id} access revoked.")
 
 
 async def groupusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List registered groups."""
+    """List registered groups. Used by admins in private messages."""
     state: State = context.application.bot_data["state"]
     
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can list groups.")
         return
     
-    pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
-    approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
-    rejected = ", ".join(map(str, state.registrations.users("rejected"))) or "none"
+    pending = ", ".join(map(str, state.group_registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.group_registrations.users("approved"))) or "none"
+    rejected = ", ".join(map(str, state.group_registrations.users("rejected"))) or "none"
     await update.message.reply_text(
         f"Group Registrations:\n"
         f"Pending: {pending}\n"
@@ -1137,7 +1219,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.message.reply_text(
         "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help\n\n"
-        "Group commands (admin only): /startgroup /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
+        "Group commands (admin only): /startgroup <id> /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
     )
 
 
@@ -1207,7 +1289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state: State = context.application.bot_data["state"]
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
-    group_id = update.effective_chat.id if chat_type == "group" else None
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
     
     # Private message handling (existing behavior)
     if chat_type == "private":
@@ -1273,24 +1355,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for chunk in chunks:
             await update.message.reply_text(chunk)
     
-    # Group message handling (new)
-    elif chat_type == "group":
-        # Check if group is allowed
+    # Group chat message handling (new)
+    elif chat_type in ("group", "supergroup"):
+        # Check if group is allowed (static allowlist OR approved registration)
         if not state.allowed_group(group_id):
             return  # Silent ignore for disallowed groups
         
         # Get bot username for @mention check
         bot_username = context.bot.username if context.bot else "telegram_bot"
-        text = (update.message.text or "").strip()[: state.settings.max_chars]
+        
+        # Get full text from entity-aware parsing, then apply max_chars limit
+        clean_text = remove_bot_mention(update.message, bot_username)
+        # Enforce max_chars limit (same as private messages)
+        clean_text = clean_text[: state.settings.max_chars]
         
         # Check @mention requirement
-        if not has_mention_botname(text, bot_username):
+        if not has_mention_botname(update.message, bot_username):
             return  # Silent ignore without @mention
         
-        # Remove @mention from text for processing
-        clean_text = text.replace(f"@{bot_username}", "").strip()
         if not clean_text:
-            return
+            return  # Message was only the bot mention
         
         # Clean old request timestamps (> 1 minute ago)
         now = time.monotonic()
@@ -1370,12 +1454,10 @@ def main() -> None:
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Group chat message handler (opt-in via TELEGRAM_ALLOWED_GROUP_IDS)
-    if settings.allowed_group_ids:
-        # Only process group messages with @mention (handled in handle_message)
-        app.add_handler(MessageHandler(filters.ChatType.GROUP & filters.TEXT & ~filters.COMMAND, handle_message))
+    # Group chat message handler (supports group and supergroup types)
+    app.add_handler(MessageHandler((filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Group registration commands (Phase 2) - require admin privileges
+    # Group registration commands (Phase 2) - all private commands used by admins
     group_commands = {"startgroup": startgroup, "approvegroup": approvegroup, 
                       "rejectgroup": rejectgroup, "revokegroup": revokegroup, "groupusers": groupusers}
     for name, callback in group_commands.items():

@@ -7,14 +7,14 @@ Extend the Telegram bot to optionally handle messages in allowed groups, with pe
 
 ### Environment Variables
 - `TELEGRAM_ALLOWED_GROUP_IDS` - Comma-separated group chat IDs (optional, empty = group chat disabled)
-- `TELEGRAM_ADMIN_GROUP_IDS` - Comma-separated group IDs that can use admin commands (optional, empty = no group admin commands)
+- `TELEGRAM_ADMIN_USER_IDS` - Comma-separated Telegram user IDs that can manage group permissions
 
 ### Features
 1. **Group message filtering**: Only process messages from allowed groups
 2. **@mention botname**: In group chats, messages must mention the bot (e.g., @telegram-bot) to trigger responses
 3. **Per-group state**: Conversation history and usage counters per (user, group) pair
-4. **Group-specific registration**: Groups need approval before the bot can respond in them
-5. **Admin commands**: Only `TELEGRAM_ADMIN_USER_IDS` + `TELEGRAM_ADMIN_GROUP_IDS` users can manage group permissions
+4. **Group-specific registration**: Groups need approval before the bot can respond in them via `/startgroup`
+5. **Admin commands**: Only `TELEGRAM_ADMIN_USER_IDS` users can manage group permissions
 
 ### Security Considerations
 - Group chats are inherently less secure than private messages
@@ -56,17 +56,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ```
 
 ### Group Registration Flow
-1. User sends `/startgroup` in a group chat
+1. Admin sends `/startgroup <group_id>` privately (admin-only command)
 2. Bot creates pending group registration (stored in `registrations.json` with group ID)
 3. Admin approves via `/approvegroup <group_id>`
 4. Bot starts responding in that group
 
 ### Commands (Group Context)
-- `/startgroup` - Request to join a group
-- `/approvegroup <group_id>` - Admin approves group
-- `/rejectgroup <group_id>` - Admin rejects group
-- `/revokegroup <group_id>` - Remove group access
-- `/groupusers` - List groups bot is in
+- `/startgroup <group_id>` - Admin sends this command privately to request adding bot to a group
+- `/approvegroup <group_id>` - Admin approves group access
+- `/rejectgroup <group_id>` - Admin rejects group access
+- `/revokegroup <group_id>` - Admin removes group access
+- `/groupusers` - List groups bot is registered in
 - `/groupstatus <group_id>` - Show group-specific stats
 
 ## Implementation Plan
