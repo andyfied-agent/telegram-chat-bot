@@ -22,8 +22,16 @@ from enum import Enum
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Load .env file if it exists (prior to any os.getenv calls)
+dotenv_path = Path.home() / ".env"
+if dotenv_path.exists():
+    load_dotenv(dotenv_path)
+elif Path(".env").exists():
+    load_dotenv(".env")
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
