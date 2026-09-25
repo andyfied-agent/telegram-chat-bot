@@ -295,6 +295,26 @@ def _parse_provider_limits(value: str) -> dict[str, int]:
     return limits
 
 
+def _parse_user_rate_limits(value: str) -> dict[int, float]:
+    """Parse JSON user rate limits without accepting malformed configuration."""
+    try:
+        parsed = json.loads(value or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("USER_RATE_LIMITS must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("USER_RATE_LIMITS must be a JSON object")
+    limits: dict[int, float] = {}
+    for user_id_str, interval in parsed.items():
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            raise ValueError(f"USER_RATE_LIMITS user IDs must be integers, got {user_id_str!r}")
+        if not isinstance(interval, (int, float)) or interval <= 0:
+            raise ValueError(f"USER_RATE_LIMITS values must be positive numbers, got {interval!r}")
+        limits[user_id] = float(interval)
+    return limits
+
+
 _state_lock = asyncio.Lock()
 
 
@@ -434,7 +454,8 @@ class Settings:
     openrouter_enabled: bool = field(default_factory=lambda: _parse_bool_setting(os.getenv("OPENROUTER_ENABLED", "false"), "OPENROUTER_ENABLED"))
     openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
     max_concurrent_requests: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_CONCURRENT_REQUESTS", "2"), "MAX_CONCURRENT_REQUESTS", as_float=False))
-
+    user_rate_limits: dict[int, float] = field(default_factory=lambda: _parse_user_rate_limits(os.getenv("USER_RATE_LIMITS", "{}")))
+    
     # Resilience settings
     circuit_breaker_failure_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"), "CIRCUIT_BREAKER_FAILURE_THRESHOLD"))
     circuit_breaker_success_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", "2"), "CIRCUIT_BREAKER_SUCCESS_THRESHOLD"))
@@ -1237,6 +1258,24 @@ async def ratelimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check llama.cpp service health."""
+    state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
+    
+    model_name, is_online = health_check(state.settings.base_url, state.settings.timeout)
+    
+    lines = [
+        "🏥 Health Check:",
+        f"Model: {model_name}",
+        f"Status: {'✅ Online' if is_online else '❌ Offline'}",
+        f"Endpoint: {state.settings.base_url}",
+    ]
+    
+    await update.message.reply_text("\n".join(lines))
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: State = context.application.bot_data["state"]
     user_id = update.effective_user.id
@@ -1538,7 +1577,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             maxlen=60
         )
         
-        if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
+        # Check per-user rate limit or fall back to global setting
+        user_rate_limit = state.settings.user_rate_limits.get(user_id, state.settings.request_interval)
+        if now - state.last_request.get(user_id, 0) < user_rate_limit:
             await update.message.reply_text("Please wait a moment before sending another message.")
             return
         state.last_request[user_id] = now
@@ -1621,7 +1662,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             maxlen=60
         )
         
-        if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
+        # Check per-user rate limit or fall back to global setting
+        user_rate_limit = state.settings.user_rate_limits.get(user_id, state.settings.request_interval)
+        if now - state.last_request.get(user_id, 0) < user_rate_limit:
             await update.message.reply_text("Please wait a moment before sending another message.")
             return
         state.last_request[user_id] = now
@@ -1700,6 +1743,7 @@ async def main() -> None:
         BotCommand("status", "Show model and history info"),
         BotCommand("metrics", "Show request statistics"),
         BotCommand("ratelimit", "Show rate limit status"),
+        BotCommand("health", "Check llama.cpp service health"),
         BotCommand("usage", "Show daily usage"),
         BotCommand("resilience", "Show resilience/circuit breaker status"),
         BotCommand("reset", "Clear conversation history"),
@@ -1728,7 +1772,7 @@ async def main() -> None:
     only_private = private()
     # Private-only commands (admin/user)
     private_commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
-                "status": status, "metrics": metrics, "ratelimit": ratelimit,
+                "status": status, "metrics": metrics, "ratelimit": ratelimit, "health": health,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
                 "shutdown": shutdown, "help": help_command, "usage": usage, "resilience": resilience_status}
     for name, callback in private_commands.items():

@@ -18,6 +18,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 - **Central logging** to rotating file at `~/.local/state/telegram-chat-bot/logs/telegram-chat-bot.log` (override with `TELEGRAM_BOT_LOG_DIR=/mnt/scratch/hermes/logs` on compute01)
 - **Metrics tracking** via /metrics command (request stats, success rate, avg response time)
 - **Rate-limit visibility** via /ratelimit command
+- **Service health check** via /health command (checks llama.cpp connectivity and reports model name)
 - Response chunking: long model outputs (> 4096 chars) are automatically split into Telegram-compatible chunks
 - Improved error messages: differentiated messages for timeouts, HTTP errors, and failures
 - Telegram native command menu for discoverability
@@ -64,6 +65,7 @@ Set the following environment variables (documented in .env.example):
 - TELEGRAM_BOT_LOG_DIR -- Log directory for rotating file handler. Default: ~/.local/state/telegram-chat-bot/logs (override with /mnt/scratch/hermes/logs on compute01).
 - TELEGRAM_ALLOWED_GROUP_IDS -- Optional: Comma-separated group chat IDs to allow bot responses in (e.g., `-1001234567890`). Group messages require @botname mention in supergroups.
 - GROUP_ACCESS_MODE -- Optional: Group access policy (`all`, `approved_users`, or `admins`). Default: `all`.
+- USER_RATE_LIMITS -- Optional: JSON object for per-user rate limit overrides, e.g., `{"123456789": 30.0, "987654321": 60.0}` for user-specific cooldowns.
 
 ## Numeric Setting Validation
 
@@ -121,6 +123,8 @@ Or use the convenience script:
 - /shutdown -- Refused remotely; stop the local systemd service instead.
 - /metrics -- Shows request statistics: total/successful/failed requests, success rate, average response time, concurrent limit status.
 - /ratelimit -- Shows per-user and global rate-limit status: requests in last minute, cooldown, last request age, available semaphore slots.
+- /health -- Checks llama.cpp service health and reports model name.
+- /usage -- Shows daily request and token usage.
 
 ### Group Chat Commands (private or in-group)
 
@@ -163,13 +167,15 @@ The bot registers the following handlers:
 - /revoke -> revoke -- Revoke approved access
 - /users -> users -- List registration state
 - /status -> status -- Model + history window
+- /metrics -> metrics -- Request statistics
+- /ratelimit -> ratelimit -- Rate-limit status
+- /health -> health -- Service health check
+- /usage -> usage -- Daily usage report
 - /addglobalprompt -> addglobalprompt -- Set global system prompt
 - /addprivateprompt -> addprivateprompt -- Set per-user system prompt
 - /shutdown -> shutdown -- Refused remotely
 - /help -> help_command -- List commands
-- /metrics -> metrics -- Request statistics
-- /ratelimit -> ratelimit -- Rate-limit status
-- /usage -> usage -- Daily usage report
+- /resilience -> resilience_status -- Circuit breaker status
 
 ### Group Commands
 - /startgroup -> startgroup -- Request to add bot to group
@@ -186,7 +192,14 @@ The bot registers the following handlers:
 - /history -> history -- Report memory size
 - text (non-command) -> handle_message -- Chat completion via llama.cpp
 
-## Usage accounting and quotas
+### Usage accounting and quotas
+
+Per-user rate limits:
+Set `USER_RATE_LIMITS` in your `.env` file to override the global `MODEL_REQUEST_INTERVAL` for specific users. Format: JSON object mapping Telegram user IDs to cooldown seconds (in seconds). Example:
+```env
+USER_RATE_LIMITS={"123456789": 30.0, "987654321": 60.0}
+```
+This is useful for throttling power users while allowing others faster response times.
 
 The bot stores daily request and token counters in the same atomically-written
 state file as conversation state. Counters are keyed by Telegram user and
