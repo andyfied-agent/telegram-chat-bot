@@ -1,22 +1,26 @@
 # Telegram Chat Bot
 
-A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds only to allowed users in private (direct) messages.
+A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds to allowed users in private messages and approved group chats.
 
 ## Features
 
-- Responds only to private (direct) messages -- group chat messages are ignored
+- **Private messages**: Responds only to private (direct) messages from allowed users
+- **Group chat support**: Optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`
 - Allowlist-based user filtering via TELEGRAM_ALLOWED_USER_IDS
-- Approval-based registration requests via /start, persisted across restarts
+- Group access modes: `all` (any user), `approved_users` (registered users only), or `admins` (admin-only)
+- Approval-based registration requests via /start (users) and /startgroup (groups)
 - Conversational chat backed by a local llama.cpp / OpenAI-compatible API
 - Context retention with configurable message history window
 - Bounded model responses (max_tokens, character truncation)
-- System prompt support: global and per-user private prompts
+- System prompt support: global, per-user private prompts, and per-group prompts
 - Rate limiting between model requests (per-user cooldown)
 - **Concurrent request limiting** via MAX_CONCURRENT_REQUESTS setting
 - **Central logging** to rotating file at `~/.local/state/telegram-chat-bot/logs/telegram-chat-bot.log` (override with `TELEGRAM_BOT_LOG_DIR=/mnt/scratch/hermes/logs` on compute01)
-- **Metrics tracking** via /metrics command
+- **Metrics tracking** via /metrics command (request stats, success rate, avg response time)
 - **Rate-limit visibility** via /ratelimit command
 - Response chunking: long model outputs (> 4096 chars) are automatically split into Telegram-compatible chunks
+- Improved error messages: differentiated messages for timeouts, HTTP errors, and failures
+- Telegram native command menu for discoverability
 
 ## Requirements
 
@@ -50,7 +54,7 @@ Set the following environment variables (documented in .env.example):
 - TELEGRAM_ALLOWED_USER_IDS -- Comma-separated Telegram numeric user IDs. If unset or empty, all Telegram users are rejected.
 - TELEGRAM_ADMIN_USER_IDS -- Comma-separated Telegram numeric user IDs with authority to change the global prompt and manage registrations. If unset or empty, admin commands are denied to all users.
 - TELEGRAM_REGISTRATION_FILE -- JSON registration store. Default: ~/.local/state/telegram-chat-bot/registrations.json.
-- LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:11438/v1.
+- LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:8081/v1.
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
 - MAX_CONTEXT_MESSAGES -- Max conversation history messages per user. Default: 20.
@@ -58,6 +62,8 @@ Set the following environment variables (documented in .env.example):
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 - MAX_CONCURRENT_REQUESTS -- Maximum concurrent model requests allowed. Default: 2. Set to 1 for strict serialization.
 - TELEGRAM_BOT_LOG_DIR -- Log directory for rotating file handler. Default: ~/.local/state/telegram-chat-bot/logs (override with /mnt/scratch/hermes/logs on compute01).
+- TELEGRAM_ALLOWED_GROUP_IDS -- Optional: Comma-separated group chat IDs to allow bot responses in (e.g., `-1001234567890`). Group messages require @botname mention in supergroups.
+- GROUP_ACCESS_MODE -- Optional: Group access policy (`all`, `approved_users`, or `admins`). Default: `all`.
 
 ## Numeric Setting Validation
 
@@ -99,7 +105,7 @@ Or use the convenience script:
 
 ./telegram-chat-bot.sh
 
-### Commands (private chat only)
+### Commands (private chat)
 
 - /start -- Approved users receive a greeting; other users create or check an access request. Optional /start parameters are rejected and never affect registration.
 - /approve <telegram_user_id> -- Administrator-only approval of a pending user.
@@ -107,8 +113,8 @@ Or use the convenience script:
 - /revoke <telegram_user_id> -- Administrator-only revocation of approved access.
 - /users -- Administrator-only list of pending and approved registrations.
 - /status -- Shows current model name and history window size.
-- /reset -- Clears your conversation context.
-- /history -- Reports how many messages are retained in memory.
+- /reset -- Clears your conversation context (also works in groups).
+- /history -- Reports how many messages are retained in memory (also works in groups).
 - /addglobalprompt <text> -- Sets a global system prompt for all users.
 - /addprivateprompt <text> -- Sets a per-user system prompt.
 - /help -- Lists all available commands.
@@ -116,35 +122,68 @@ Or use the convenience script:
 - /metrics -- Shows request statistics: total/successful/failed requests, success rate, average response time, concurrent limit status.
 - /ratelimit -- Shows per-user and global rate-limit status: requests in last minute, cooldown, last request age, available semaphore slots.
 
+### Group Chat Commands (private or in-group)
+
+- /startgroup <group_id> -- Request to add bot to a group (admin only, private chat).
+- /approvegroup <group_id> -- Approve group access (admin only).
+- /rejectgroup <group_id> -- Reject group access (admin only).
+- /revokegroup <group_id> -- Revoke group access (admin only).
+- /groupusers -- List all approved groups (admin only).
+- /setgroupprompt <group_id> <text> -- Set group-specific system prompt (admin only).
+- /showgroupprompt <group_id> -- View group prompt (admin only).
+- /cleargroupprompt <group_id> -- Clear group prompt (admin only).
+
+### Usage in Groups
+
+- In supergroups, messages must include @botname mention to trigger a response.
+- Group access modes: `all` (any user), `approved_users` (registered users only), or `admins` (admin-only).
+- Per-group prompts and conversation history are isolated from private chats.
+
 ### Shutdown
 
 Shutdown via Telegram is intentionally disabled. Stop the bot by terminating the local service or process.
 
 ## Security
 
-- Allowlisting: TELEGRAM_ALLOWED_USER_IDS remains a static allowlist. Users approved through the persistent registration workflow are also allowed; unregistered users cannot chat or change prompts.
-- Private-only: All handlers use filters.ChatType.PRIVATE; group messages are silently ignored.
-- Remote shutdown disabled: The /shutdown command returns a polite refusal and suggests stopping the systemd service.
-- Admin authorization: TELEGRAM_ADMIN_USER_IDS authorizes prompt and registration-management commands. If it is unset or empty, no user can change the global prompt or registrations.
-- Registration: /start records a pending request only; an administrator must approve it. Registration data contains Telegram numeric IDs and should be protected and backed up as private state.
+- **Allowlisting**: TELEGRAM_ALLOWED_USER_IDS remains a static allowlist. Users approved through the persistent registration workflow are also allowed; unregistered users cannot chat or change prompts.
+- **Group access modes**: `all` (any user), `approved_users` (registered users only), or `admins` (admin-only). Configure with `GROUP_ACCESS_MODE`.
+- **Remote shutdown disabled**: The /shutdown command returns a polite refusal and suggests stopping the systemd service.
+- **Admin authorization**: TELEGRAM_ADMIN_USER_IDS required for prompt and registration-management commands. If it is unset or empty, no user can change the global prompt or registrations.
+- **Registration**: /start records a pending request only; an administrator must approve it. Registration data contains Telegram numeric IDs and should be protected and backed up as private state.
+- **Private prompt isolation**: Private user prompts are never leaked into group chat requests.
 
 ## Real Commands in Code
 
 The bot registers the following handlers:
 
+### Private-Only Commands
 - /start -> start -- Greeting or registration request
 - /approve -> approve -- Approve a registration
 - /reject -> reject -- Reject a registration
 - /revoke -> revoke -- Revoke approved access
 - /users -> users -- List registration state
 - /status -> status -- Model + history window
-- /reset -> reset -- Clear conversation history
-- /history -> history -- Report memory size
-- /usage -> usage -- Report today's request and token usage
 - /addglobalprompt -> addglobalprompt -- Set global system prompt
-- /addprivateprompt -> addprivateprompt -- Set per-user private prompt
+- /addprivateprompt -> addprivateprompt -- Set per-user system prompt
 - /shutdown -> shutdown -- Refused remotely
 - /help -> help_command -- List commands
+- /metrics -> metrics -- Request statistics
+- /ratelimit -> ratelimit -- Rate-limit status
+- /usage -> usage -- Daily usage report
+
+### Group Commands
+- /startgroup -> startgroup -- Request to add bot to group
+- /approvegroup -> approvegroup -- Approve group access
+- /rejectgroup -> rejectgroup -- Reject group access
+- /revokegroup -> revokegroup -- Revoke group access
+- /groupusers -> groupusers -- List approved groups
+- /setgroupprompt -> setgroupprompt -- Set group-specific prompt
+- /showgroupprompt -> showgroupprompt -- View group prompt
+- /cleargroupprompt -> cleargroupprompt -- Clear group prompt
+
+### Universal Commands (private and group)
+- /reset -> reset -- Clear conversation history
+- /history -> history -- Report memory size
 - text (non-command) -> handle_message -- Chat completion via llama.cpp
 
 ## Usage accounting and quotas
@@ -175,6 +214,37 @@ To protect the llama.cpp server from overload, the bot limits concurrent model r
 
 All bot activity is logged to `~/.local/state/telegram-chat-bot/logs/telegram-chat-bot.log` with rotating file handler (10MB per file, 5 backups). Logs include request timestamps, errors, and provider failures. Override with `TELEGRAM_BOT_LOG_DIR=/mnt/scratch/hermes/logs` on compute01.
 
+## Group Chat Support
+
+To enable group chat support:
+
+1. Set `TELEGRAM_ALLOWED_GROUP_IDS` in your `.env` file with comma-separated group IDs (e.g., `-1001234567890`). Group message IDs are negative.
+2. Optionally set `GROUP_ACCESS_MODE`:
+   - `all` (default): Any user in allowed groups can interact
+   - `approved_users`: Only users who have been approved via `/start` can interact
+   - `admins`: Only users in `TELEGRAM_ADMIN_USER_IDS` can interact
+
+3. In supergroups, messages must include @botname mention to trigger a response.
+
+### Group Commands
+
+Admin commands for group management:
+- `/startgroup <group_id>` - Request to add bot to a group (private chat only)
+- `/approvegroup <group_id>` - Approve group access
+- `/rejectgroup <group_id>` - Reject group access
+- `/revokegroup <group_id>` - Revoke group access
+- `/groupusers` - List all approved groups
+
+### Group Prompts
+
+Admin commands for group-specific prompts:
+- `/setgroupprompt <group_id> <prompt>` - Set group-specific system prompt
+- `/showgroupprompt <group_id>` - View current group prompt
+- `/cleargroupprompt <group_id>` - Remove group prompt
+
+Group prompts are isolated from private user prompts and only apply to group conversations.
+
+---
 
 ## Tests
 
