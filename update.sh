@@ -69,9 +69,14 @@ mkdir -p "$log_dir_expanded"
 echo ""
 echo "Update complete!"
 echo "---------------"
-if [ "$ENV_EXISTS" = "no" ]; then
-    echo "⚠ Run: echo 'TELEGRAM_TOKEN=\"your_token\"' >> .env"
+
+# Restart the bot service if systemd is available and running
+if command -v systemctl > /dev/null 2>&1 && systemctl --user is-active --quiet telegram-chat-bot; then
+    systemctl --user restart telegram-chat-bot
+    echo "✓ Bot service restarted successfully"
+elif [ "$ENV_EXISTS" = "no" ]; then
+    echo "⚠ Set TELEGRAM_TOKEN before starting manually"
 else
-    echo "✓ Token preserved. Run: ./telegram-chat-bot.sh to start"
+    echo "ℹ Bot service not running. Start manually with: ./telegram-chat-bot.sh"
 fi
 echo "---------------"
