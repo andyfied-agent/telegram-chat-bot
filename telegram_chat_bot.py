@@ -384,29 +384,41 @@ class Settings:
 
 
 class RegistrationStore:
-    """Persist pending and approved Telegram user registrations atomically."""
-
-    def __init__(self, path: str) -> None:
+    """Persist pending and approved Telegram user and group registrations atomically."""
+    
+    def __init__(self, path: str, group: bool = False) -> None:
+        """
+        Initialize registration store.
+        
+        Args:
+            path: File path for storage
+            group: If True, this is a group registration store; if False, user registration store
+        """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.group = group
         if self.path.exists():
             self._users = json.loads(self.path.read_text())
             if not isinstance(self._users, dict):
                 raise ValueError("registration store must contain an object")
         else:
             self._users: dict[str, str] = {}
-
-    def status(self, user_id: int) -> str | None:
+    
+    def status(self, user_id: int | str) -> str | None:
+        """Return registration status for user or group ID."""
         return self._users.get(str(user_id))
-
-    def set_status(self, user_id: int, status: str) -> None:
+    
+    def set_status(self, user_id: int | str, status: str) -> None:
+        """Set registration status for user or group ID."""
         if status not in {"pending", "approved", "rejected"}:
             raise ValueError(f"invalid registration status: {status}")
         self._users[str(user_id)] = status
         self._save()
-
+    
     def users(self, status: str | None = None) -> list[int]:
-        return sorted(int(user_id) for user_id, value in self._users.items() if status is None or value == status)
+        """Return list of registered users/groups, optionally filtered by status."""
+        return sorted(int(user_id) for user_id, value in self._users.items() 
+                     if status is None or value == status)
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -889,9 +901,100 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can list users.")
         return
+    
     pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
     approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
     await update.message.reply_text(f"Pending: {pending}\nApproved: {approved}")
+
+
+# Group registration commands (Phase 2)
+async def startgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Request to add bot to a group."""
+    state: State = context.application.bot_data["state"]
+    
+    # Get group ID from the message context (not from args)
+    if not update.effective_chat or update.effective_chat.type != "group":
+        await update.message.reply_text("This command can only be used in a group chat.")
+        return
+    
+    group_id = update.effective_chat.id
+    
+    # Ignore any arguments - always register the actual group
+    await update.message.reply_text(
+        f"Group {group_id} registration request created. "
+        f"An administrator must approve it before the bot can respond."
+    )
+    state.registrations.set_status(group_id, "pending")
+
+
+async def approvegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve a group registration."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can approve groups.")
+        return
+    
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /approvegroup <telegram_group_id>")
+        return
+    
+    group_id = int(context.args[0])
+    state.registrations.set_status(group_id, "approved")
+    await update.message.reply_text(f"Group {group_id} approved.")
+
+
+async def rejectgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject a group registration."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can reject groups.")
+        return
+    
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /rejectgroup <telegram_group_id>")
+        return
+    
+    group_id = int(context.args[0])
+    state.registrations.set_status(group_id, "rejected")
+    await update.message.reply_text(f"Group {group_id} rejected.")
+
+
+async def revokegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Revoke access for a group."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can revoke groups.")
+        return
+    
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /revokegroup <telegram_group_id>")
+        return
+    
+    group_id = int(context.args[0])
+    state.registrations.set_status(group_id, "rejected")
+    await update.message.reply_text(f"Group {group_id} access revoked.")
+
+
+async def groupusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List registered groups."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can list groups.")
+        return
+    
+    pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
+    rejected = ", ".join(map(str, state.registrations.users("rejected"))) or "none"
+    await update.message.reply_text(
+        f"Group Registrations:\n"
+        f"Pending: {pending}\n"
+        f"Approved: {approved}\n"
+        f"Rejected: {rejected}"
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1033,7 +1136,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help\n\n"
+        "Group commands (admin only): /startgroup /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
     )
 
 
@@ -1270,6 +1374,12 @@ def main() -> None:
     if settings.allowed_group_ids:
         # Only process group messages with @mention (handled in handle_message)
         app.add_handler(MessageHandler(filters.ChatType.GROUP & filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Group registration commands (Phase 2) - require admin privileges
+    group_commands = {"startgroup": startgroup, "approvegroup": approvegroup, 
+                      "rejectgroup": rejectgroup, "revokegroup": revokegroup, "groupusers": groupusers}
+    for name, callback in group_commands.items():
+        app.add_handler(CommandHandler(name, callback, filters=only_private))
     
     logger.info("Starting bot with llama.cpp model %s", settings.model)
     # Python 3.14 no longer creates the main-thread event loop implicitly.
