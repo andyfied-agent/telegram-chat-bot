@@ -9,11 +9,21 @@ from urllib.error import URLError
 
 import pytest
 
-from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, complete,
+from telegram_chat_bot import (CompletionResult, State, Settings, UsageState, ProviderTimeoutError, complete,
                                complete_with_usage, private, _chunk, log_provider_failure,
                                get_provider_failures, _provider_failures,
                                _truncate_history_by_limit, _write_state_atomic,
                                handle_message)
+
+@pytest.fixture(autouse=True)
+def reset_circuit_breakers():
+    """Reset circuit breaker state between all tests."""
+    from telegram_chat_bot import _provider_circuit_breakers
+    _provider_circuit_breakers.clear()
+    yield
+    _provider_circuit_breakers.clear()
+
+
 
 
 def test_private_filter():
@@ -136,7 +146,7 @@ def test_complete_empty_response(mock_urlopen):
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
-    with pytest.raises(RuntimeError, match='model request failed'):
+    with pytest.raises(ProviderTimeoutError):
         complete(settings, messages)
 
 
@@ -147,7 +157,7 @@ def test_complete_http_error(mock_urlopen):
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
-    with pytest.raises(RuntimeError, match='model request failed'):
+    with pytest.raises(ProviderTimeoutError):
         complete(settings, messages)
 
 
@@ -160,7 +170,7 @@ def test_complete_json_error(mock_urlopen):
 
     settings = Settings(token='test_token')
     messages = [{'role': 'user', 'content': 'Test message'}]
-    with pytest.raises(RuntimeError, match='model request failed'):
+    with pytest.raises(ProviderTimeoutError):
         complete(settings, messages)
 
 
@@ -337,8 +347,8 @@ def test_complete_independent_timeout():
     import time
     from unittest.mock import patch, MagicMock
 
-    # Create a settings object with a very short timeout
-    settings = Settings(token="test", timeout=0.1)
+    # Create a settings object with a very short timeout and fewer retries
+    settings = Settings(token="test", timeout=0.1, max_retries=1)
 
     mock_response = MagicMock()
 

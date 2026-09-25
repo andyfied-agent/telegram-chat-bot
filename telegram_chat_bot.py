@@ -6,9 +6,11 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import tempfile
 import time
+import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -16,6 +18,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Callable
+from enum import Enum
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -59,6 +62,11 @@ def _ensure_logging_initialized() -> None:
         _init_logging()
 
 
+class HTTPClientError(Exception):
+    """Non-retryable HTTP client errors (4xx)."""
+    pass
+
+
 @dataclass(frozen=True)
 class ProviderFailure:
     """Record a provider failure without exposing credentials or URLs."""
@@ -89,6 +97,125 @@ def get_provider_failures() -> list[ProviderFailure]:
 
 class ProviderTimeoutError(RuntimeError):
     """Raised when the bounded provider request exceeds its timeout."""
+
+
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int = 5
+    success_threshold: int = 2
+    cooldown_seconds: float = 60.0
+    half_open_max_requests: int = 2
+    lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+
+    def __post_init__(self):
+        # Ensure half_open_max_requests equals success_threshold for proper recovery
+        if self.half_open_max_requests != self.success_threshold:
+            object.__setattr__(self, 'half_open_max_requests', self.success_threshold)
+
+    _state: CircuitState = CircuitState.CLOSED
+    _failure_count: int = 0
+    _success_count: int = 0
+    _last_failure_time: float | None = None
+    _half_open_requests: int = 0
+
+    def record_success(self) -> None:
+        with self.lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.success_threshold:
+                    self._close()
+            elif self._state in (CircuitState.CLOSED, CircuitState.OPEN):
+                # Reset failure count on success in CLOSED or OPEN state to prevent
+                # slow accumulation of failures (e.g., 5 isolated failures separated by
+                # hundreds of successes could open the circuit)
+                self._failure_count = 0
+                self._last_failure_time = None
+
+    def record_failure(self) -> None:
+        with self.lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._state == CircuitState.CLOSED and self._failure_count >= self.failure_threshold:
+                self._open()
+            elif self._state == CircuitState.HALF_OPEN:
+                self._open()
+
+    def _open(self) -> None:
+        self._state = CircuitState.OPEN
+        self._success_count = 0
+        self._half_open_requests = 0
+
+    def _close(self) -> None:
+        self._state = CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time = None
+
+    def can_proceed(self) -> bool:
+        if self._state == CircuitState.CLOSED:
+            return True
+        if self._state == CircuitState.OPEN:
+            if self._last_failure_time and time.time() - self._last_failure_time >= self.cooldown_seconds:
+                self._state = CircuitState.HALF_OPEN
+                self._half_open_requests = 1
+                return True
+            return False
+        if self._state == CircuitState.HALF_OPEN:
+            if self._half_open_requests < self.half_open_max_requests:
+                self._half_open_requests += 1
+                return True
+            return False
+        return False
+
+    def get_state(self) -> str:
+        return self._state.value
+
+    def get_stats(self) -> dict:
+        return {
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            "success_count": self._success_count,
+            "last_failure_time": self._last_failure_time,
+            "half_open_requests": self._half_open_requests,
+        }
+
+
+@dataclass
+class RetryConfig:
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 30.0
+    jitter: bool = True
+    retryable_errors: tuple[type[Exception], ...] = (ProviderTimeoutError, RuntimeError)
+
+
+_provider_circuit_breakers: dict[str, "CircuitBreaker"] = {}
+
+
+def get_circuit_breaker(provider: str, settings: "Settings | None" = None) -> "CircuitBreaker":
+    if provider not in _provider_circuit_breakers:
+        if settings:
+            _provider_circuit_breakers[provider] = CircuitBreaker(
+                failure_threshold=settings.circuit_breaker_failure_threshold,
+                success_threshold=settings.circuit_breaker_success_threshold,
+                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+                half_open_max_requests=2,  # equals success_threshold
+            )
+        else:
+            _provider_circuit_breakers[provider] = CircuitBreaker()
+    return _provider_circuit_breakers[provider]
+
+
+def get_all_circuit_breaker_stats() -> dict[str, dict]:
+    return {provider: cb.get_stats() for provider, cb in _provider_circuit_breakers.items()}
 
 
 def _validate_numeric_setting(value: str, setting_name: str, *, as_float: bool = False) -> float:
@@ -220,6 +347,15 @@ class Settings:
     openrouter_daily_request_limit: int = field(default_factory=lambda: _validate_limit_setting(os.getenv("OPENROUTER_DAILY_REQUEST_LIMIT", "50"), "OPENROUTER_DAILY_REQUEST_LIMIT"))
     max_concurrent_requests: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_CONCURRENT_REQUESTS", "2"), "MAX_CONCURRENT_REQUESTS", as_float=False))
 
+    # Resilience settings
+    circuit_breaker_failure_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"), "CIRCUIT_BREAKER_FAILURE_THRESHOLD"))
+    circuit_breaker_success_threshold: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_SUCCESS_THRESHOLD", "2"), "CIRCUIT_BREAKER_SUCCESS_THRESHOLD"))
+    circuit_breaker_cooldown_seconds: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60.0"), "CIRCUIT_BREAKER_COOLDOWN_SECONDS", as_float=True))
+    max_retries: int = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MAX_RETRIES", "3"), "MAX_RETRIES"))
+    retry_base_delay: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("RETRY_BASE_DELAY", "1.0"), "RETRY_BASE_DELAY", as_float=True))
+    retry_max_delay: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("RETRY_MAX_DELAY", "30.0"), "RETRY_MAX_DELAY", as_float=True))
+
+
 
 class RegistrationStore:
     """Persist pending and approved Telegram user registrations atomically."""
@@ -270,13 +406,30 @@ class CompletionResult:
         return self.prompt_tokens + self.completion_tokens
 
 
-def complete_with_usage(settings: Settings, messages: list[dict[str, str]]) -> CompletionResult:
+def complete_with_usage(settings: Settings, messages: list[dict[str, str]], provider: str | None = None) -> CompletionResult:
     """Make a model request with an independent timeout.
 
     Uses a ThreadPoolExecutor to run the HTTP request in a separate thread
     with a configurable timeout, ensuring a stalled provider cannot block
     the Telegram request.
     """
+    provider = provider or settings.provider
+    circuit_breaker = get_circuit_breaker(provider, settings)
+    # Define transient HTTP statuses that warrant retry (5xx only, not 4xx)
+    transient_http_statuses = {500, 502, 503, 504}
+    
+    def should_retry_http_error(exc: HTTPError) -> bool:
+        return exc.code in transient_http_statuses
+    
+    retry_config = RetryConfig(
+        max_retries=settings.max_retries,
+        base_delay=settings.retry_base_delay,
+        max_delay=settings.retry_max_delay,
+        jitter=True,
+        retryable_errors=(ProviderTimeoutError, RuntimeError, URLError),
+        # HTTPError handling is special-cased below
+    )
+    
     payload = json.dumps({
         "model": settings.model,
         "messages": messages,
@@ -303,21 +456,73 @@ def complete_with_usage(settings: Settings, messages: list[dict[str, str]]) -> C
             raise ValueError("invalid token usage in model response")
         return CompletionResult(text=text[: settings.max_chars], prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens)
+    # Retry loop with circuit breaker
+    last_exception: Exception | None = None
+    attempt = 0
 
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(do_request)
-    try:
-        return future.result(timeout=settings.timeout)
-    except FuturesTimeoutError as exc:
-        future.cancel()
-        raise ProviderTimeoutError("model request timed out") from exc
-    except (HTTPError, URLError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
-        raise RuntimeError("model request failed") from exc
-    finally:
-        # Do not wait on a provider that has already exceeded the caller's
-        # deadline. The request itself has the same socket timeout and the
-        # future is cancelled when it has not started yet.
-        executor.shutdown(wait=False, cancel_futures=True)
+    while attempt <= retry_config.max_retries:
+        # Check circuit breaker before each attempt
+        if not circuit_breaker.can_proceed():
+            raise ProviderTimeoutError(f"Circuit breaker OPEN for provider '{provider}'")
+
+        try:
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(do_request)
+            try:
+                result = future.result(timeout=settings.timeout)
+                # Success: record and return
+                circuit_breaker.record_success()
+                return result
+            except FuturesTimeoutError as exc:
+                # Timeout: record failure, cancel future
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, "timeout")
+                future.cancel()
+                raise ProviderTimeoutError("model request timed out") from exc
+            except HTTPError as exc:
+                # Only retry transient HTTP errors (5xx), not client errors (4xx)
+                if should_retry_http_error(exc):
+                    circuit_breaker.record_failure()
+                    log_provider_failure(provider, f"HTTP {exc.code}")
+                    last_exception = exc
+                else:
+                    # Non-retryable: record failure and raise a special exception
+                    circuit_breaker.record_failure()
+                    log_provider_failure(provider, f"HTTP {exc.code}")
+                    raise HTTPClientError(f"HTTP {exc.code}: {exc.reason}") from exc
+            except retry_config.retryable_errors as exc:
+                # Retryable error: record failure
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, type(exc).__name__)
+                last_exception = exc
+            except HTTPClientError:
+                # Already recorded, re-raise as-is
+                raise
+            except Exception as exc:
+                # Non-retryable error: record failure, raise immediately
+                circuit_breaker.record_failure()
+                log_provider_failure(provider, type(exc).__name__)
+                raise ProviderTimeoutError(f"provider error: {type(exc).__name__}") from exc
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        except ProviderTimeoutError:
+            # If circuit breaker is now open, don't retry
+            if not circuit_breaker.can_proceed():
+                raise
+
+        attempt += 1
+        if attempt <= retry_config.max_retries:
+            # Exponential backoff with jitter
+            delay = min(retry_config.base_delay * (2 ** (attempt - 1)), retry_config.max_delay)
+            if retry_config.jitter:
+                delay *= (0.5 + random.random())
+            time.sleep(delay)
+
+    # Max retries exceeded
+    # Raise with cause if we have one, otherwise without
+    if last_exception is not None:
+        raise ProviderTimeoutError(f"Provider '{provider}' failed after {retry_config.max_retries} retries") from last_exception
+    raise ProviderTimeoutError(f"Provider '{provider}' failed after {retry_config.max_retries} retries")
 
 
 def complete(settings: Settings, messages: list[dict[str, str]]) -> str:
@@ -774,7 +979,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
     )
 
 
@@ -792,6 +997,37 @@ async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Tokens: {stats['total_tokens']} ({stats['prompt_tokens']} prompt, "
         f"{stats['completion_tokens']} completion)"
     )
+
+
+
+async def resilience_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show circuit breaker and resilience stats for all providers."""
+    state: State = context.application.bot_data["state"]
+    if not state.allowed(update.effective_user.id):
+        return
+    
+    cb_stats = get_all_circuit_breaker_stats()
+    failures = get_provider_failures()
+    
+    lines = ["Resilience Status:"]
+    
+    if cb_stats:
+        for provider, stats in cb_stats.items():
+            lines.append(f"  {provider}:")
+            lines.append(f"    State: {stats['state']}")
+            lines.append(f"    Failures: {stats['failure_count']}")
+            if stats['last_failure_time']:
+                since = time.time() - stats['last_failure_time']
+                lines.append(f"    Last failure: {since:.0f}s ago")
+    else:
+        lines.append("  No circuit breakers recorded yet.")
+    
+    if failures:
+        lines.append(f"\nRecent failures ({len(failures)}):")
+        for f in failures[-5:]:
+            lines.append(f"  - {f.provider}: {f.error_type}")
+    
+    await update.message.reply_text("\n".join(lines))
 
 
 def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
@@ -839,6 +1075,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     state.total_requests += 1
     state.user_request_count[user_id] += 1
+    user_msg_index = len(state.history[user_id])
     state.history[user_id].append({"role": "user", "content": text})
     await state.persist()
     try:
@@ -852,18 +1089,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state.total_response_time += response_time
         finally:
             state.request_semaphore.release()
-    except ProviderTimeoutError:
+    except (ProviderTimeoutError, RuntimeError, HTTPClientError):
         state.failed_requests += 1
-        state.history[user_id].pop()
-        log_provider_failure(provider, "timeout")
-        logger.exception("llama.cpp request timed out for user %s", user_id)
-        await state.persist()
-        await update.message.reply_text("The model request timed out. Please try again shortly.")
-        return
-    except RuntimeError:
-        state.failed_requests += 1
-        state.history[user_id].pop()
-        log_provider_failure(provider, "request_failed")
+        # Remove the user message we added (at user_msg_index), preserving any concurrent messages
+        if len(state.history[user_id]) > user_msg_index:
+            del state.history[user_id][user_msg_index]
+        log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await state.persist()
         await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
@@ -891,7 +1122,7 @@ def main() -> None:
     commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
                 "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
-                "shutdown": shutdown, "help": help_command, "usage": usage}
+                "shutdown": shutdown, "help": help_command, "usage": usage, "resilience": resilience_status}
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
