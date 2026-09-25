@@ -872,6 +872,12 @@ class State:
     def allowed(self, user_id: int) -> bool:
         return user_id in self.settings.allowed_user_ids or self.user_registrations.status(user_id) == "approved"
     
+    def user_status(self, user_id: int) -> str:
+        """Return registration status for a user: 'unregistered', 'pending', 'rejected', or 'approved'."""
+        if user_id in self.settings.allowed_user_ids:
+            return "approved"
+        return self.user_registrations.status(user_id) or "unregistered"
+    
     def allowed_group(self, group_id: int) -> bool:
         """Check if group is allowed via TELEGRAM_ALLOWED_GROUP_IDS OR approved registration."""
         # Check both static allowlist and registration store
@@ -1303,8 +1309,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Private message handling (existing behavior)
     if chat_type == "private":
-        if not state.allowed(user_id):
+        user_status = state.user_status(user_id)
+        
+        # Send status-based messages for non-approved users
+        if user_status == "unregistered":
+            await update.message.reply_text(
+                "You don't have access yet. Send `/start` to request access."
+            )
             return
+        elif user_status == "pending":
+            await update.message.reply_text(
+                "Your access request is pending approval. Please wait for an administrator to approve it."
+            )
+            return
+        elif user_status == "rejected":
+            await update.message.reply_text(
+                "Your access request was rejected. If you believe this is a mistake, please contact an administrator."
+            )
+            return
+        # If approved, continue with normal message handling below
         text = (update.message.text or "").strip()[: state.settings.max_chars]
         if not text:
             return

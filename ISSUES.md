@@ -32,12 +32,11 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Implementation:** ✅ Complete - Shows total/successful/failed requests, success rate, avg response time, concurrent limit.
 
 ### 7. Group Chat Support
-**Status:** Open  
-**Priority:** Medium  
-**Description:** The bot currently only responds in private (direct) messages.  
-**Solution:** Add optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
+**Status:** Complete  
+**Description:** Added optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
+**Solution:** Implemented group filtering, per-group state, and group registration workflow.  
 **Impact:** Enables bot usage in moderated group chats and team workspaces.
-**Blocked:** Not started - Requires significant refactoring.
+**Implementation:** ✅ Complete - Added group context management, @mention detection, and group registration commands.
 
 ---
 
@@ -58,11 +57,11 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Implementation:** ✅ Complete - Daily backups with rotation policy.
 
 ### 8. Group Chat Registration System
-**Status:** Open  
-**Description:** Groups would need their own registration/approval system.  
-**Solution:** Extend `RegistrationStore` to handle group IDs.  
+**Status:** Complete  
+**Description:** Groups need their own registration/approval system.  
+**Solution:** Implemented `/startgroup`, `/approvegroup`, `/rejectgroup`, `/revokegroup` commands.  
 **Impact:** Admin control over group interactions.
-**Status:** 🔴 Blocked - Depends on Issue #7.
+**Implementation:** ✅ Complete - Group registration store and approval workflow implemented.
 
 ---
 
@@ -81,18 +80,18 @@ The following GitHub issues have been addressed:
 
 ## Current Status Summary
 
-| Category | Total | Complete | Remaining |
-|----------|-------|----------|-----------|
-| High Priority | 1 | 1 | 0 |
-| Medium Priority | 3 | 2 | 1 |
-| Low Priority | 3 | 2 | 1 |
-| **Total** | **7** | **5** | **2** |
+|| Category | Total | Complete | Remaining |
+||----------|-------|----------|-----------|
+|| High Priority | 1 | 1 | 0 |
+|| Medium Priority | 4 | 4 | 0 |
+|| Low Priority | 4 | 3 | 1 |
+|| **Total** | **9** | **8** | **1** |
 
 **Test Coverage:** 115 tests passing (100 from main + 15 new tests for concurrent limiting, rate-limit visibility, and logging)
 
-**Next Action:** Issue #7 (Group Chat Support) requires significant refactoring; not prioritized.
+**Next Action:** Issue #41 (Improve user-facing model and provider error messages) - minor UX enhancement.
 
 ---
 
-**Last updated:** 2026-09-24
+**Last updated:** 2026-09-25
 **Bot version:** Latest (all 115 tests pass, service running)
