@@ -50,7 +50,8 @@ echo "Installing dependencies..."
 echo "Creating log directory..."
 # Default to user state directory (portable), override with /mnt/scratch/hermes/logs on compute01
 log_dir="${TELEGRAM_BOT_LOG_DIR:-~/.local/state/telegram-chat-bot/logs}"
-log_dir_expanded=$(eval echo "$log_dir")
+# Safe expansion without eval - use shell parameter expansion
+log_dir_expanded="${log_dir/#\~/$HOME}"
 mkdir -p "$log_dir_expanded"
 
 echo ""

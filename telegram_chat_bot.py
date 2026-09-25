@@ -1319,25 +1319,21 @@ async def setgroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     chat_type = update.effective_chat.type
-    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
     
-    # If args provided, parse as: /setgroupprompt <group_id> <prompt>
-    # If no args, use current chat's group_id
-    if context.args:
-        try:
-            group_id = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
-            return
-        
-        prompt = " ".join(context.args[1:]).strip()
-    else:
-        # No args - must be in a group to use current group
-        if not group_id:
-            await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt> (in private) or /setgroupprompt <prompt> (in group)")
-            return
-        prompt = " ".join(context.args).strip() if context.args else ""
+    # Always expect: /setgroupprompt <group_id> <prompt>
+    if not context.args:
+        await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
+        return
     
+    # First arg is always group_id
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
+        return
+    
+    # Remaining args are the prompt
+    prompt = " ".join(context.args[1:]).strip()
     if not prompt:
         await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
         return
@@ -1642,9 +1638,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if "timeout" in str(sys.exc_info()[1]).lower() or "timed out" in str(sys.exc_info()[1]).lower():
                 await update.message.reply_text("The model request timed out. The server may be busy. Please try again in a moment.")
             elif isinstance(sys.exc_info()[1], HTTPClientError):
-                await update.message.reply_text("The model server returned an error. An administrator has been notified. Please try again shortly.")
+                await update.message.reply_text("The model server returned an error. Please try again shortly.")
             else:
-                await update.message.reply_text("The model request failed. An administrator has been notified. Please try again shortly.")
+                await update.message.reply_text("The model request failed. Please try again shortly.")
             return
         state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
         state.history[(user_id, group_id)].append({"role": "assistant", "content": result.text})
@@ -1746,5 +1742,5 @@ async def main() -> None:
         await app.shutdown()
 
 
-async def _run_main():
+if __name__ == "__main__":
     asyncio.run(main())

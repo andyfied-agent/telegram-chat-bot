@@ -15,16 +15,19 @@ class TestGroupResetHistoryReachability:
         """Group chat users should be able to reset their group context."""
         from telegram_chat_bot import reset
         
-        # Create mock update for group chat
-        chat = Chat(id=456, type="group")
-        user = User(id=123, first_name="Test", is_bot=False)
-        update = Update(
-            update_id=1,
-            message=MagicMock(
-                chat=chat,
-                effective_user=user,
-                reply_text=AsyncMock()
-            )
+        # Create proper mock update for group chat
+        chat = MagicMock()
+        chat.type = "group"
+        chat.id = 456
+        
+        user = MagicMock()
+        user.id = 123
+        
+        update = MagicMock()
+        update.effective_chat = chat
+        update.effective_user = user
+        update.message = MagicMock(
+            reply_text=AsyncMock()
         )
         
         # Create mock context
@@ -49,16 +52,20 @@ class TestGroupResetHistoryReachability:
         """Group chat users should be able to view their group context."""
         from telegram_chat_bot import history
         
-        # Create mock update for group chat
-        chat = Chat(id=456, type="group")
-        user = User(id=123, first_name="Test", is_bot=False)
-        update = Update(
-            update_id=1,
-            message=MagicMock(
-                chat=chat,
-                effective_user=user,
-                reply_text=AsyncMock()
-            )
+        # Create proper mock update for group chat
+        # effective_chat must be set (not chat)
+        chat = MagicMock()
+        chat.type = "group"
+        chat.id = 456
+        
+        user = MagicMock()
+        user.id = 123
+        
+        update = MagicMock()
+        update.effective_chat = chat
+        update.effective_user = user
+        update.message = MagicMock(
+            reply_text=AsyncMock()
         )
         
         # Create mock context
