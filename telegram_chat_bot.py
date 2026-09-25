@@ -308,16 +308,16 @@ def _parse_user_rate_limits(value: str) -> dict[int, float]:
         try:
             user_id = int(user_id_str)
         except ValueError:
-            raise ValueError(f"USER_RATE_LIMITS user IDs must be integers, got {user_id_str!r}")
+            raise ValueError("USER_RATE_LIMITS user IDs must be integers, got {!r}".format(user_id_str))
         if isinstance(interval, bool):
-            raise ValueError(f"USER_RATE_LIMITS values must be numbers, not booleans (true/false)")
+            raise ValueError("USER_RATE_LIMITS values must be numbers, not booleans (true/false)")
         if not isinstance(interval, (int, float)):
-            raise ValueError(f"USER_RATE_LIMITS values must be positive numbers, got {interval!r}")
+            raise ValueError("USER_RATE_LIMITS values must be positive numbers, got {!r}".format(interval))
         if interval <= 0:
-            raise ValueError(f"USER_RATE_LIMITS values must be positive, got {interval!r}")
+            raise ValueError("USER_RATE_LIMITS values must be positive, got {!r}".format(interval))
         # Reject NaN and Infinity
         if math.isnan(interval) or math.isinf(interval):
-            raise ValueError(f"USER_RATE_LIMITS values must be finite numbers")
+            raise ValueError("USER_RATE_LIMITS values must be finite numbers")
         limits[user_id] = float(interval)
     return limits
 
@@ -1475,6 +1475,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/status - Show model and history info\n"
         "/metrics - Show request statistics\n"
         "/ratelimit - Show rate limit status\n"
+        "/health - Check llama.cpp service health\n"
         "/usage - Show daily usage\n"
         "/resilience - Show resilience/circuit breaker status\n"
         "/reset - Clear conversation history\n"

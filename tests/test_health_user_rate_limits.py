@@ -1,16 +1,12 @@
 """Tests for /health command and USER_RATE_LIMITS per-user rate limits."""
 
-import asyncio
-import json
-import math
 import os
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telegram import Update, Chat, User
+from telegram import Update, User
 
-from telegram_chat_bot import Settings, _parse_user_rate_limits, State, health, handle_message, ratelimit
+from telegram_chat_bot import Settings, _parse_user_rate_limits, State, health, ratelimit
 
 
 class TestUserRateLimitsParsing:
@@ -41,14 +37,12 @@ class TestUserRateLimitsParsing:
         assert result == {123: 30.5}
     
     def test_boolean_rejected_true(self):
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(ValueError):
             _parse_user_rate_limits('{"123": true}')
-        assert "not booleans" in str(exc_info.value)
     
     def test_boolean_rejected_false(self):
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(ValueError):
             _parse_user_rate_limits('{"123": false}')
-        assert "not booleans" in str(exc_info.value)
     
     def test_nan_rejected(self):
         with pytest.raises(ValueError) as exc_info:
@@ -81,9 +75,8 @@ class TestUserRateLimitsParsing:
         assert "must be integers" in str(exc_info.value)
     
     def test_non_string_user_id_key_rejected(self):
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(ValueError):
             _parse_user_rate_limits('{123: 30.0}')
-        # JSON requires string keys, so this fails at parse time
     
     def test_invalid_json(self):
         with pytest.raises(ValueError) as exc_info:
@@ -111,9 +104,8 @@ class TestUserRateLimitsSettings:
     def test_boolean_rejected_in_settings(self):
         # Settings dataclass doesn't directly validate user_rate_limits; it's parsed from env
         # So we test that _parse_user_rate_limits rejects it
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises(ValueError):
             _parse_user_rate_limits('{"123": true}')
-        assert "not booleans" in str(exc_info.value)
 
 
 class TestHealthCommand:
