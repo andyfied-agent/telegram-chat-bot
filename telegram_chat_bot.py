@@ -100,7 +100,6 @@ class ProviderTimeoutError(RuntimeError):
 
 
 
-
 class CircuitState(Enum):
     CLOSED = "closed"
     OPEN = "open"
@@ -288,6 +287,69 @@ def _parse_provider_limits(value: str) -> dict[str, int]:
 _state_lock = asyncio.Lock()
 
 
+def remove_bot_mention(update_message, bot_username: str) -> str:
+    """Remove the bot mention from message text using entity-aware parsing.
+    
+    Uses parse_entity to properly handle UTF-16 code unit offsets,
+    avoiding issues with emoji/non-BMP characters before the mention.
+    
+    Args:
+        update_message: Telegram message object with entities
+        bot_username: The bot's username (without @)
+    
+    Returns:
+        Message text with the bot mention removed.
+    """
+    if not update_message.entities:
+        return update_message.text
+    
+    text = update_message.text
+    # Find all entities that match the bot mention
+    for entity in update_message.entities:
+        mention_text = update_message.parse_entity(entity)
+        if mention_text and mention_text.lower() == f"@{bot_username}".lower():
+            # Remove the mention and strip
+            return text.replace(mention_text, "").strip()
+    
+    return text
+
+
+def has_mention_botname(update_message, bot_username: str) -> bool:
+    """Check if message contains an actual @<bot_username> mention using Telegram entities.
+    
+    Args:
+        update_message: The message object from Telegram update
+        bot_username: The bot's username (without @)
+    
+    Returns:
+        True if message contains an actual mention of this bot, False otherwise.
+        Uses Telegram's message entities for accurate detection.
+    """
+    if not update_message.entities:
+        return False
+    
+    # Telegram entities are case-sensitive, so we need to match exactly
+    # but we'll also check case-insensitively for robustness
+    for entity in update_message.entities:
+        if entity.type == "mention":
+            # Use parse_entity to properly handle UTF-16 code unit offsets
+            mentioned_user = update_message.parse_entity(entity)
+            if mentioned_user and mentioned_user.lstrip("@").lower() == bot_username.lower():
+                return True
+        elif entity.type == "bot_command":
+            # Bot commands like @botname command are also mentions
+            command_text = update_message.parse_entity(entity)
+            if command_text and command_text.lower() == f"@{bot_username}".lower():
+                return True
+    
+    return False
+
+
+def _state_key(user_id: int, group_id: int | None = None) -> int | tuple[int, int]:
+    """Return state key: user_id for private, (user_id, group_id) for groups."""
+    return (user_id, group_id) if group_id is not None else user_id
+
+
 def _write_state_atomic(state_file: str, data: dict) -> None:
     """Write state atomically with restrictive permissions (0o600)."""
     dir_path = Path(state_file).parent
@@ -343,6 +405,9 @@ class Settings:
     admin_user_ids: frozenset[int] = field(default_factory=lambda: frozenset(
         int(value.strip()) for value in os.getenv("TELEGRAM_ADMIN_USER_IDS", "").split(",") if value.strip()
     ))
+    allowed_group_ids: frozenset[int] = field(default_factory=lambda: frozenset(
+        int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_GROUP_IDS", "").split(",") if value.strip()
+    ))
     request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
@@ -367,30 +432,42 @@ class Settings:
 
 
 class RegistrationStore:
-    """Persist pending and approved Telegram user registrations atomically."""
-
-    def __init__(self, path: str) -> None:
+    """Persist pending and approved Telegram user and group registrations atomically."""
+    
+    def __init__(self, path: str, group: bool = False) -> None:
+        """
+        Initialize registration store.
+        
+        Args:
+            path: File path for storage
+            group: If True, this is a group registration store; if False, user registration store
+        """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.group = group
         if self.path.exists():
             self._users = json.loads(self.path.read_text())
             if not isinstance(self._users, dict):
                 raise ValueError("registration store must contain an object")
         else:
             self._users: dict[str, str] = {}
-
-    def status(self, user_id: int) -> str | None:
+    
+    def status(self, user_id: int | str) -> str | None:
+        """Return registration status for user or group ID."""
         return self._users.get(str(user_id))
-
-    def set_status(self, user_id: int, status: str) -> None:
+    
+    def set_status(self, user_id: int | str, status: str) -> None:
+        """Set registration status for user or group ID."""
         if status not in {"pending", "approved", "rejected"}:
             raise ValueError(f"invalid registration status: {status}")
         self._users[str(user_id)] = status
         self._save()
-
+    
     def users(self, status: str | None = None) -> list[int]:
-        return sorted(int(user_id) for user_id, value in self._users.items() if status is None or value == status)
-
+        """Return list of registered users/groups, optionally filtered by status."""
+        return sorted(int(user_id) for user_id, value in self._users.items() 
+                     if status is None or value == status)
+    
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.")
@@ -698,16 +775,22 @@ class UsageState:
 class State:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.history: dict[int, deque[dict[str, str]]] = defaultdict(
+        # Support both private (user_id only) and group (user_id, group_id tuple) keys
+        self.history: dict[int | tuple[int, int], deque[dict[str, str]]] = defaultdict(
             lambda: deque(maxlen=settings.max_messages)
         )
         self.global_prompt = ""
         self.private_prompts: dict[int, str] = {}
         self.last_request: dict[int, float] = {}
         self.request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
-        self.registrations = RegistrationStore(settings.registration_file)
+        # Separate registration stores for users and groups
+        self.user_registrations = RegistrationStore(settings.registration_file, group=False)
+        self.group_registrations = RegistrationStore(str(Path(settings.registration_file).with_name("group_registrations.json")), group=True)
         self.usage = UsageState(settings)
         self._persisted = False
+        
+        # Rate-limit tracking: timestamps of requests in the last minute per user (private only)
+        self.user_requests_minute: dict[int, deque[float]] = defaultdict(deque)
         
         # Metrics tracking
         self.total_requests: int = 0
@@ -715,9 +798,6 @@ class State:
         self.failed_requests: int = 0
         self.total_response_time: float = 0.0
         self.user_request_count: dict[int, int] = defaultdict(int)
-        
-        # Rate-limit tracking: timestamps of requests in the last minute per user
-        self.user_requests_minute: dict[int, deque[float]] = defaultdict(deque)
 
     def _load(self) -> None:
         """Load state from file on disk."""
@@ -727,21 +807,41 @@ class State:
         self.global_prompt = data.get("global_prompt", "")
         self.private_prompts = {int(k): v for k, v in data.get("private_prompts", {}).items()}
         user_history = data.get("user_history", {})
-        for user_id_str, msgs in user_history.items():
-            user_id = int(user_id_str)
+        for user_key_str, msgs in user_history.items():
+            # Deserialize keys: if contains ":", it's "user_id:group_id" tuple; otherwise int
+            if ":" in user_key_str:
+                parts = user_key_str.split(":")
+                if len(parts) == 2:
+                    user_id = int(parts[0])
+                    group_id = int(parts[1])
+                    key = (user_id, group_id)
+                else:
+                    # Fallback: treat as user_id
+                    key = int(user_key_str)
+            else:
+                key = int(user_key_str)
             # Truncate to max_history limit if exceeded
             truncated = _truncate_history_by_limit(msgs, self.settings.max_history)
-            self.history[user_id] = deque(truncated, maxlen=self.settings.max_messages)
+            self.history[key] = deque(truncated, maxlen=self.settings.max_messages)
         self.last_request = {int(k): v for k, v in data.get("last_request", {}).items()}
         self.usage.load_dict(data.get("usage", {}))
         self._persisted = True
 
     def _dump(self) -> None:
         """Dump state to file atomically with restrictive permissions."""
+        # Serialize history keys: int stays as int string, tuple becomes "user_id:group_id"
+        user_history: dict[str, list[dict[str, str]]] = {}
+        for key, msgs in self.history.items():
+            if isinstance(key, tuple):
+                user_key = f"{key[0]}:{key[1]}"
+            else:
+                user_key = str(key)
+            user_history[user_key] = list(msgs)
+        
         data = {
             "global_prompt": self.global_prompt,
             "private_prompts": self.private_prompts,
-            "user_history": {str(uid): list(msgs) for uid, msgs in self.history.items()},
+            "user_history": user_history,
             "last_request": self.last_request,
             "usage": self.usage.to_dict(),
         }
@@ -752,24 +852,36 @@ class State:
         async with _state_lock:
             self._dump()
 
-    async def reset(self, user_id: int) -> None:
-        """Reset user state: clear history and last_request."""
-        self.history.pop(user_id, None)
+    async def reset(self, user_id: int, group_id: int | None = None) -> None:
+        """Reset user state: clear history and last_request for user (and group if specified)."""
+        key = _state_key(user_id, group_id)
+        self.history.pop(key, None)
         self.last_request.pop(user_id, None)
         await self.persist()
 
     def allowed(self, user_id: int) -> bool:
-        return user_id in self.settings.allowed_user_ids or self.registrations.status(user_id) == "approved"
-
+        return user_id in self.settings.allowed_user_ids or self.user_registrations.status(user_id) == "approved"
+    
+    def allowed_group(self, group_id: int) -> bool:
+        """Check if group is allowed via TELEGRAM_ALLOWED_GROUP_IDS OR approved registration."""
+        # Check both static allowlist and registration store
+        if group_id in self.settings.allowed_group_ids:
+            return True
+        if self.group_registrations.status(group_id) == "approved":
+            return True
+        return False
+    
     def admin(self, user_id: int) -> bool:
         return user_id in self.settings.admin_user_ids
 
-    def messages(self, user_id: int) -> list[dict[str, str]]:
+    def messages(self, user_id: int, group_id: int | None = None) -> list[dict[str, str]]:
+        """Return messages for user (and group if specified)."""
+        key = _state_key(user_id, group_id)
         prompt = self.global_prompt
         if self.private_prompts.get(user_id):
             prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
         result = ([{"role": "system", "content": prompt}] if prompt else [])
-        result.extend(self.history[user_id])
+        result.extend(self.history[key])
         return result
 
 
@@ -789,14 +901,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if state.allowed(user_id):
         await update.message.reply_text("Hello! I only respond to private messages. Send me a message to chat.")
         return
-    registration_status = state.registrations.status(user_id)
+    registration_status = state.user_registrations.status(user_id)
     if registration_status == "pending":
         await update.message.reply_text("Your access request is still pending administrator approval.")
         return
     if registration_status == "rejected":
         await update.message.reply_text("Your access request was rejected by an administrator.")
         return
-    state.registrations.set_status(user_id, "pending")
+    state.user_registrations.set_status(user_id, "pending")
     await update.message.reply_text("Your access request was recorded and is pending administrator approval.")
 
 
@@ -809,7 +921,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /approve <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "approved")
+    state.user_registrations.set_status(user_id, "approved")
     await update.message.reply_text(f"User {user_id} approved.")
 
 
@@ -822,7 +934,7 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /reject <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "rejected")
+    state.user_registrations.set_status(user_id, "rejected")
     await update.message.reply_text(f"User {user_id} rejected.")
 
 
@@ -835,7 +947,7 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Usage: /revoke <telegram_user_id>")
         return
     user_id = int(context.args[0])
-    state.registrations.set_status(user_id, "rejected")
+    state.user_registrations.set_status(user_id, "rejected")
     await update.message.reply_text(f"User {user_id} revoked.")
 
 
@@ -844,9 +956,127 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not state.admin(update.effective_user.id):
         await update.message.reply_text("Only administrators can list users.")
         return
-    pending = ", ".join(map(str, state.registrations.users("pending"))) or "none"
-    approved = ", ".join(map(str, state.registrations.users("approved"))) or "none"
+    
+    pending = ", ".join(map(str, state.user_registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.user_registrations.users("approved"))) or "none"
     await update.message.reply_text(f"Pending: {pending}\nApproved: {approved}")
+
+
+# Group registration commands (Phase 2) - all private commands used by admins
+async def startgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Request to add bot to a group. Admins use this command privately."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can register groups.")
+        return
+    
+    # Get group ID from command argument (negative group ID)
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Usage: /startgroup <telegram_group_id>")
+        return
+    
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    # Telegram group IDs are negative, so this is valid
+    state.group_registrations.set_status(group_id, "pending")
+    await update.message.reply_text(
+        f"Group {group_id} registration request created. "
+        f"Once approved, the bot will respond to @botname mentions in this group."
+    )
+
+
+async def approvegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve a group registration. Used by admins in private messages."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can approve groups.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /approvegroup <telegram_group_id>")
+        return
+    
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "approved")
+    await update.message.reply_text(f"Group {group_id} approved. The bot will now respond in this group.")
+
+
+async def rejectgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject a group registration. Used by admins in private messages."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can reject groups.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /rejectgroup <telegram_group_id>")
+        return
+    
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "rejected")
+    await update.message.reply_text(f"Group {group_id} rejected.")
+
+
+async def revokegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Revoke access for a group. Used by admins in private messages."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can revoke groups.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /revokegroup <telegram_group_id>")
+        return
+    
+    group_id_str = context.args[0]
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await update.message.reply_text("Group ID must be a number (e.g., -100123456789)")
+        return
+    
+    state.group_registrations.set_status(group_id, "rejected")
+    await update.message.reply_text(f"Group {group_id} access revoked.")
+
+
+async def groupusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List registered groups. Used by admins in private messages."""
+    state: State = context.application.bot_data["state"]
+    
+    if not state.admin(update.effective_user.id):
+        await update.message.reply_text("Only administrators can list groups.")
+        return
+    
+    pending = ", ".join(map(str, state.group_registrations.users("pending"))) or "none"
+    approved = ", ".join(map(str, state.group_registrations.users("approved"))) or "none"
+    rejected = ", ".join(map(str, state.group_registrations.users("rejected"))) or "none"
+    await update.message.reply_text(
+        f"Group Registrations:\n"
+        f"Pending: {pending}\n"
+        f"Approved: {approved}\n"
+        f"Rejected: {rejected}"
+    )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -988,7 +1218,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not context.application.bot_data["state"].allowed(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help"
+        "Commands: /start /approve <id> /reject <id> /revoke <id> /users /status /metrics /ratelimit /usage /resilience /reset /history /addglobalprompt <text> /addprivateprompt <text> /shutdown /help\n\n"
+        "Group commands (admin only): /startgroup <id> /approvegroup <id> /rejectgroup <id> /revokegroup <id> /groupusers"
     )
 
 
@@ -1052,71 +1283,155 @@ def _chunk(text: str, max_chunk: int = 4096) -> list[str]:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _ensure_logging_initialized()
-    if not update.message or not update.effective_chat or update.effective_chat.type != "private":
+    if not update.message or not update.effective_chat:
         return
+    
     state: State = context.application.bot_data["state"]
     user_id = update.effective_user.id
-    if not state.allowed(user_id):
-        return
-    text = (update.message.text or "").strip()[: state.settings.max_chars]
-    if not text:
-        return
+    chat_type = update.effective_chat.type
+    group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
     
-    # Clean old request timestamps (> 1 minute ago)
-    now = time.monotonic()
-    cutoff = now - 60.0
-    state.user_requests_minute[user_id] = deque(
-        (t for t in state.user_requests_minute[user_id] if t > cutoff),
-        maxlen=60
-    )
-    
-    if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
-        await update.message.reply_text("Please wait a moment before sending another message.")
-        return
-    state.last_request[user_id] = now
-    state.user_requests_minute[user_id].append(now)
-    provider = state.settings.provider
-    allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
-    if not allowed:
-        await update.message.reply_text(
-            f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
+    # Private message handling (existing behavior)
+    if chat_type == "private":
+        if not state.allowed(user_id):
+            return
+        text = (update.message.text or "").strip()[: state.settings.max_chars]
+        if not text:
+            return
+        
+        # Clean old request timestamps (> 1 minute ago)
+        now = time.monotonic()
+        cutoff = now - 60.0
+        state.user_requests_minute[user_id] = deque(
+            (t for t in state.user_requests_minute[user_id] if t > cutoff),
+            maxlen=60
         )
-        return
-    state.total_requests += 1
-    state.user_request_count[user_id] += 1
-    # Store reference to the exact dict object appended, for robust removal on failure
-    user_msg_dict = {"role": "user", "content": text}
-    state.history[user_id].append(user_msg_dict)
-    await state.persist()
-    try:
-        # Acquire semaphore with logging to track concurrent requests
-        await state.request_semaphore.acquire()
-        start_time = time.monotonic()
-        try:
-            result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id))
-            response_time = time.monotonic() - start_time
-            state.successful_requests += 1
-            state.total_response_time += response_time
-        finally:
-            state.request_semaphore.release()
-    except (ProviderTimeoutError, RuntimeError, HTTPClientError):
-        state.failed_requests += 1
-        # Remove the exact dict object we appended (identity-based, survives identical messages)
-        for index, message in enumerate(state.history[user_id]):
-            if message is user_msg_dict:
-                del state.history[user_id][index]
-                break
-        log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
-        logger.exception("llama.cpp request failed for user %s", user_id)
+        
+        if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
+            await update.message.reply_text("Please wait a moment before sending another message.")
+            return
+        state.last_request[user_id] = now
+        state.user_requests_minute[user_id].append(now)
+        provider = state.settings.provider
+        allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
+        if not allowed:
+            await update.message.reply_text(
+                f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
+            )
+            return
+        state.total_requests += 1
+        state.user_request_count[user_id] += 1
+        # Store reference to the exact dict object appended, for robust removal on failure
+        user_msg_dict = {"role": "user", "content": text}
+        state.history[user_id].append(user_msg_dict)
         await state.persist()
-        await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
-        return
-    state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
-    state.history[user_id].append({"role": "assistant", "content": result.text})
-    await state.persist()
-    chunks = _chunk(result.text)
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
+        try:
+            # Acquire semaphore with logging to track concurrent requests
+            await state.request_semaphore.acquire()
+            start_time = time.monotonic()
+            try:
+                result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id))
+                response_time = time.monotonic() - start_time
+                state.successful_requests += 1
+                state.total_response_time += response_time
+            finally:
+                state.request_semaphore.release()
+        except (ProviderTimeoutError, RuntimeError, HTTPClientError):
+            state.failed_requests += 1
+            # Remove the exact dict object we appended (identity-based, survives identical messages)
+            for index, message in enumerate(state.history[user_id]):
+                if message is user_msg_dict:
+                    del state.history[user_id][index]
+                    break
+            log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
+            logger.exception("llama.cpp request failed for user %s", user_id)
+            await state.persist()
+            await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
+            return
+        state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
+        state.history[user_id].append({"role": "assistant", "content": result.text})
+        await state.persist()
+        chunks = _chunk(result.text)
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+    
+    # Group chat message handling (new)
+    elif chat_type in ("group", "supergroup"):
+        # Check if group is allowed (static allowlist OR approved registration)
+        if not state.allowed_group(group_id):
+            return  # Silent ignore for disallowed groups
+        
+        # Get bot username for @mention check
+        bot_username = context.bot.username if context.bot else "telegram_bot"
+        
+        # Get full text from entity-aware parsing, then apply max_chars limit
+        clean_text = remove_bot_mention(update.message, bot_username)
+        # Enforce max_chars limit (same as private messages)
+        clean_text = clean_text[: state.settings.max_chars]
+        
+        # Check @mention requirement
+        if not has_mention_botname(update.message, bot_username):
+            return  # Silent ignore without @mention
+        
+        if not clean_text:
+            return  # Message was only the bot mention
+        
+        # Clean old request timestamps (> 1 minute ago)
+        now = time.monotonic()
+        cutoff = now - 60.0
+        state.user_requests_minute[user_id] = deque(
+            (t for t in state.user_requests_minute[user_id] if t > cutoff),
+            maxlen=60
+        )
+        
+        if now - state.last_request.get(user_id, 0) < state.settings.request_interval:
+            await update.message.reply_text("Please wait a moment before sending another message.")
+            return
+        state.last_request[user_id] = now
+        state.user_requests_minute[user_id].append(now)
+        provider = state.settings.provider
+        allowed, limit, _remaining = state.usage.reserve_request(user_id, provider)
+        if not allowed:
+            await update.message.reply_text(
+                f"Daily request limit reached for {provider} ({limit} requests). Please try again tomorrow."
+            )
+            return
+        state.total_requests += 1
+        state.user_request_count[user_id] += 1
+        # Store reference to the exact dict object appended, for robust removal on failure
+        user_msg_dict = {"role": "user", "content": clean_text}
+        state.history[(user_id, group_id)].append(user_msg_dict)
+        await state.persist()
+        try:
+            # Acquire semaphore with logging to track concurrent requests
+            await state.request_semaphore.acquire()
+            start_time = time.monotonic()
+            try:
+                result = await asyncio.to_thread(complete_with_usage, state.settings, state.messages(user_id, group_id))
+                response_time = time.monotonic() - start_time
+                state.successful_requests += 1
+                state.total_response_time += response_time
+            finally:
+                state.request_semaphore.release()
+        except (ProviderTimeoutError, RuntimeError, HTTPClientError):
+            state.failed_requests += 1
+            # Remove the exact dict object we appended (identity-based, survives identical messages)
+            key = (user_id, group_id)
+            for index, message in enumerate(state.history[key]):
+                if message is user_msg_dict:
+                    del state.history[key][index]
+                    break
+            log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
+            logger.exception("llama.cpp request failed for user %s in group %s", user_id, group_id)
+            await state.persist()
+            await update.message.reply_text("I couldn't reach the local model. Please try again shortly.")
+            return
+        state.usage.record_tokens(user_id, provider, result.prompt_tokens, result.completion_tokens)
+        state.history[(user_id, group_id)].append({"role": "assistant", "content": result.text})
+        await state.persist()
+        chunks = _chunk(result.text)
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
 
 
 def main() -> None:
@@ -1138,6 +1453,16 @@ def main() -> None:
     for name, callback in commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Group chat message handler (supports group and supergroup types)
+    app.add_handler(MessageHandler((filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Group registration commands (Phase 2) - all private commands used by admins
+    group_commands = {"startgroup": startgroup, "approvegroup": approvegroup, 
+                      "rejectgroup": rejectgroup, "revokegroup": revokegroup, "groupusers": groupusers}
+    for name, callback in group_commands.items():
+        app.add_handler(CommandHandler(name, callback, filters=only_private))
+    
     logger.info("Starting bot with llama.cpp model %s", settings.model)
     # Python 3.14 no longer creates the main-thread event loop implicitly.
     try:
