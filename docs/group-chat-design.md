@@ -11,7 +11,7 @@ Extend the Telegram bot to optionally handle messages in allowed groups, with pe
 
 ### Features
 1. **Group message filtering**: Only process messages from allowed groups
-2. **@mention prefix**: In group chats, require @botusername prefix to trigger responses (unless configured otherwise)
+2. **@mention botname**: In group chats, messages must mention the bot (e.g., @telegram-bot) to trigger responses
 3. **Per-group state**: Conversation history and usage counters per (user, group) pair
 4. **Group-specific registration**: Groups need approval before the bot can respond in them
 5. **Admin commands**: Only `TELEGRAM_ADMIN_USER_IDS` + `TELEGRAM_ADMIN_GROUP_IDS` users can manage group permissions
@@ -45,8 +45,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # Silent ignore
     
     # Check @mention requirement for groups
-    if group_id and not has_mention_prefix(update.effective_message, bot_username):
-        return  # Silent ignore in groups
+    if group_id:
+        if not has_mention_botname(update.effective_message, bot_username):
+            return  # Silent ignore in groups
+    else:
+        # Private chat: no @mention required
+        pass
     
     # Rest of handler unchanged (allows, rate limiting, etc.)
 ```
@@ -87,7 +91,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ### Phase 4: Testing
 1. Mock group chat messages in tests
 2. Test group allowlist filtering
-3. Test @mention prefix detection
+3. Test @mention botname detection (not prefix)
 4. Test group registration workflow
 
 ## Open Questions

@@ -31,13 +31,13 @@
 
 ### Unit Tests
 - [ ] `test_group_chat_allowlist_filtering`
-- [ ] `test_group_mention_prefix_detection`
+- [ ] `test_group_mention_botname_detection`
 - [ ] `test_state_group_isolation`
 - [ ] `test_group_registration_flow`
 - [ ] `test_group_admin_commands`
 
 ### Integration Tests
-- [ ] Bot handles group message with @mention
+- [ ] Bot responds to messages mentioning @telegram-bot in group
 - [ ] Bot ignores group message without @mention
 - [ ] Bot ignores messages from disallowed group
 - [ ] Bot processes private messages unchanged
