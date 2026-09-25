@@ -132,12 +132,15 @@ class CircuitBreaker:
                 self._success_count += 1
                 if self._success_count >= self.success_threshold:
                     self._close()
-            elif self._state in (CircuitState.CLOSED, CircuitState.OPEN):
-                # Reset failure count on success in CLOSED or OPEN state to prevent
+            elif self._state == CircuitState.CLOSED:
+                # Reset failure count on success in CLOSED state to prevent
                 # slow accumulation of failures (e.g., 5 isolated failures separated by
                 # hundreds of successes could open the circuit)
                 self._failure_count = 0
                 self._last_failure_time = None
+            # Note: In OPEN state, we do NOT reset _last_failure_time to preserve
+            # the cooldown timer. A late success shouldn't prevent the breaker from
+            # eventually recovering.
 
     def record_failure(self) -> None:
         with self.lock:
@@ -160,32 +163,35 @@ class CircuitBreaker:
         self._last_failure_time = None
 
     def can_proceed(self) -> bool:
-        if self._state == CircuitState.CLOSED:
-            return True
-        if self._state == CircuitState.OPEN:
-            if self._last_failure_time and time.time() - self._last_failure_time >= self.cooldown_seconds:
-                self._state = CircuitState.HALF_OPEN
-                self._half_open_requests = 1
+        with self.lock:
+            if self._state == CircuitState.CLOSED:
                 return True
+            if self._state == CircuitState.OPEN:
+                if self._last_failure_time and time.time() - self._last_failure_time >= self.cooldown_seconds:
+                    self._state = CircuitState.HALF_OPEN
+                    self._half_open_requests = 1
+                    return True
+                return False
+            if self._state == CircuitState.HALF_OPEN:
+                if self._half_open_requests < self.half_open_max_requests:
+                    self._half_open_requests += 1
+                    return True
+                return False
             return False
-        if self._state == CircuitState.HALF_OPEN:
-            if self._half_open_requests < self.half_open_max_requests:
-                self._half_open_requests += 1
-                return True
-            return False
-        return False
 
     def get_state(self) -> str:
-        return self._state.value
+        with self.lock:
+            return self._state.value
 
     def get_stats(self) -> dict:
-        return {
-            "state": self._state.value,
-            "failure_count": self._failure_count,
-            "success_count": self._success_count,
-            "last_failure_time": self._last_failure_time,
-            "half_open_requests": self._half_open_requests,
-        }
+        with self.lock:
+            return {
+                "state": self._state.value,
+                "failure_count": self._failure_count,
+                "success_count": self._success_count,
+                "last_failure_time": self._last_failure_time,
+                "half_open_requests": self._half_open_requests,
+            }
 
 
 @dataclass
@@ -197,21 +203,24 @@ class RetryConfig:
     retryable_errors: tuple[type[Exception], ...] = (ProviderTimeoutError, RuntimeError)
 
 
-_provider_circuit_breakers: dict[str, "CircuitBreaker"] = {}
+# Global circuit breaker registry with lock for thread-safe creation
+_provider_circuit_breakers: dict[str, CircuitBreaker] = {}
+_provider_circuit_breakers_lock = threading.Lock()
 
 
 def get_circuit_breaker(provider: str, settings: "Settings | None" = None) -> "CircuitBreaker":
-    if provider not in _provider_circuit_breakers:
-        if settings:
-            _provider_circuit_breakers[provider] = CircuitBreaker(
-                failure_threshold=settings.circuit_breaker_failure_threshold,
-                success_threshold=settings.circuit_breaker_success_threshold,
-                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
-                half_open_max_requests=2,  # equals success_threshold
-            )
-        else:
-            _provider_circuit_breakers[provider] = CircuitBreaker()
-    return _provider_circuit_breakers[provider]
+    with _provider_circuit_breakers_lock:
+        if provider not in _provider_circuit_breakers:
+            if settings:
+                _provider_circuit_breakers[provider] = CircuitBreaker(
+                    failure_threshold=settings.circuit_breaker_failure_threshold,
+                    success_threshold=settings.circuit_breaker_success_threshold,
+                    cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+                    half_open_max_requests=2,  # equals success_threshold
+                )
+            else:
+                _provider_circuit_breakers[provider] = CircuitBreaker()
+        return _provider_circuit_breakers[provider]
 
 
 def get_all_circuit_breaker_stats() -> dict[str, dict]:
@@ -1075,8 +1084,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     state.total_requests += 1
     state.user_request_count[user_id] += 1
-    user_msg_index = len(state.history[user_id])
-    state.history[user_id].append({"role": "user", "content": text})
+    # Store reference to the exact dict object appended, for robust removal on failure
+    user_msg_dict = {"role": "user", "content": text}
+    state.history[user_id].append(user_msg_dict)
     await state.persist()
     try:
         # Acquire semaphore with logging to track concurrent requests
@@ -1091,9 +1101,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state.request_semaphore.release()
     except (ProviderTimeoutError, RuntimeError, HTTPClientError):
         state.failed_requests += 1
-        # Remove the user message we added (at user_msg_index), preserving any concurrent messages
-        if len(state.history[user_id]) > user_msg_index:
-            del state.history[user_id][user_msg_index]
+        # Remove the exact dict object we appended (identity-based, survives other deletions)
+        try:
+            state.history[user_id].remove(user_msg_dict)
+        except ValueError:
+            # Message was already removed by another concurrent failure
+            pass
         log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await state.persist()
