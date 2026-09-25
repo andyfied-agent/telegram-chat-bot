@@ -23,7 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators
+from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Load .env file if it exists (prior to any os.getenv calls)
@@ -1745,12 +1745,6 @@ async def main() -> None:
         app.add_handler(CommandHandler(name, callback, filters=only_private))
     
     logger.info("Starting bot with llama.cpp model %s", settings.model)
-    # Python 3.14 no longer creates the main-thread event loop implicitly.
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-    await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     try:
