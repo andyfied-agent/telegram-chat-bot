@@ -27,11 +27,12 @@ from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotComm
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Load .env file if it exists (prior to any os.getenv calls)
-dotenv_path = Path.home() / ".env"
+# Prefer project-local .env over home directory .env
+dotenv_path = Path(".env")
 if dotenv_path.exists():
-    load_dotenv(dotenv_path)
-elif Path(".env").exists():
-    load_dotenv(".env")
+    load_dotenv(dotenv_path, override=True)
+elif (Path.home() / ".env").exists():
+    load_dotenv(Path.home() / ".env", override=False)
 
 logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,8 +49,9 @@ def _init_logging() -> None:
     if _file_handler is not None:
         return  # Already initialized
     
-    # Configurable log directory via environment variable, defaults to /mnt/scratch/hermes/logs
-    log_dir_str = os.getenv("TELEGRAM_BOT_LOG_DIR", "/mnt/scratch/hermes/logs")
+    # Configurable log directory via environment variable
+    # Default to user state directory for portability (not compute01-specific /mnt/scratch)
+    log_dir_str = os.getenv("TELEGRAM_BOT_LOG_DIR", str(Path.home() / ".local" / "state" / "telegram-chat-bot" / "logs"))
     _log_dir = Path(log_dir_str)
     try:
         _log_dir.mkdir(parents=True, exist_ok=True)
@@ -419,7 +421,10 @@ class Settings:
         int(value.strip()) for value in os.getenv("TELEGRAM_ALLOWED_GROUP_IDS", "").split(",") if value.strip()
     ))
     # Group access mode: "all", "approved_users", or "admins" (default: "all")
-    group_access_mode: str = field(default_factory=lambda: os.getenv("GROUP_ACCESS_MODE", "all"))
+    _group_access_mode = os.getenv("GROUP_ACCESS_MODE", "all")
+    if _group_access_mode not in ("all", "approved_users", "admins"):
+        raise ValueError(f"Invalid GROUP_ACCESS_MODE: {_group_access_mode}. Must be one of: all, approved_users, admins")
+    group_access_mode: str = field(default_factory=lambda: _group_access_mode)
     request_interval: float = field(default_factory=lambda: _validate_numeric_setting(os.getenv("MODEL_REQUEST_INTERVAL", "1.0"), "MODEL_REQUEST_INTERVAL", as_float=True))
     registration_file: str = field(default_factory=lambda: os.path.expanduser(
         os.getenv("TELEGRAM_REGISTRATION_FILE", "~/.local/state/telegram-chat-bot/registrations.json")
@@ -888,36 +893,40 @@ class State:
         
         Args:
             group_id: The group ID to check
-            user_id: Optional user ID for access mode checks (default: None)
+            user_id: Optional user ID for access mode checks (required for approved_users/admins modes)
         
         Returns:
-            True if the group is allowed for the given user (or any user if user_id not specified)
+            True if the group is allowed for the given user (or any user if user_id not specified and mode is "all")
         """
+        mode = self.settings.group_access_mode
+        
         # Check static allowlist first
         if group_id in self.settings.allowed_group_ids:
             # If access mode is "all", any user can use it
-            if self.settings.group_access_mode == "all":
+            if mode == "all":
                 return True
             # Otherwise check user authorization
             if user_id is not None:
-                if self.settings.group_access_mode == "approved_users":
+                if mode == "approved_users":
                     return self.allowed(user_id)
-                elif self.settings.group_access_mode == "admins":
+                elif mode == "admins":
                     return self.admin(user_id)
-            return True  # Default to True if no user_id provided
+            # If user_id not provided and mode is restricted, require it
+            return user_id is not None
         
         # Check group registration
         if self.group_registrations.status(group_id) == "approved":
             # If access mode is "all", any user can use it
-            if self.settings.group_access_mode == "all":
+            if mode == "all":
                 return True
             # Otherwise check user authorization
             if user_id is not None:
-                if self.settings.group_access_mode == "approved_users":
+                if mode == "approved_users":
                     return self.allowed(user_id)
-                elif self.settings.group_access_mode == "admins":
+                elif mode == "admins":
                     return self.admin(user_id)
-            return True  # Default to True if no user_id provided
+            # If user_id not provided and mode is restricted, require it
+            return user_id is not None
         
         return False
     
@@ -929,10 +938,14 @@ class State:
         key = _state_key(user_id, group_id)
         prompt = self.global_prompt
         # For group requests, use group prompt instead of private prompt
-        if group_id and self.group_prompts.get(group_id):
-            prompt = f"{prompt}\n{self.group_prompts[group_id]}".strip()
-        elif self.private_prompts.get(user_id):
-            prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
+        if group_id is not None:
+            # Group request: only use group prompt, never private prompt
+            if self.group_prompts.get(group_id):
+                prompt = f"{prompt}\n{self.group_prompts[group_id]}".strip()
+        else:
+            # Private request: use private prompt
+            if self.private_prompts.get(user_id):
+                prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
         result = ([{"role": "system", "content": prompt}] if prompt else [])
         result.extend(self.history[key])
         return result
@@ -1231,7 +1244,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not state.allowed(user_id):
             return
     elif group_id:
-        if not state.allowed_group(group_id):
+        if not state.allowed_group(group_id, user_id):
             return
     else:
         return
@@ -1256,7 +1269,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not state.allowed(user_id):
             return
     elif group_id:
-        if not state.allowed_group(group_id):
+        if not state.allowed_group(group_id, user_id):
             return
     else:
         return
@@ -1309,27 +1322,25 @@ async def setgroupprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_type = update.effective_chat.type
     group_id = update.effective_chat.id if chat_type in ("group", "supergroup") else None
     
-    if not group_id:
-        await update.message.reply_text("This command must be sent in a group chat, or use `/setgroupprompt <group_id> <prompt>` in private.")
-        return
-    
-    # If args provided, parse group_id and prompt
+    # If args provided, parse as: /setgroupprompt <group_id> <prompt>
+    # If no args, use current chat's group_id
     if context.args:
-        # Try to parse: /setgroupprompt <group_id> <prompt>
-        group_id_str = context.args[0]
         try:
-            group_id = int(group_id_str)
+            group_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text("Invalid group ID format.")
+            await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
             return
         
         prompt = " ".join(context.args[1:]).strip()
     else:
-        # Use current chat's group_id
+        # No args - must be in a group to use current group
+        if not group_id:
+            await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt> (in private) or /setgroupprompt <prompt> (in group)")
+            return
         prompt = " ".join(context.args).strip() if context.args else ""
     
     if not prompt:
-        await update.message.reply_text("Usage: /setgroupprompt <prompt> (in group) or /setgroupprompt <group_id> <prompt> (private)")
+        await update.message.reply_text("Usage: /setgroupprompt <group_id> <prompt>")
         return
     
     state.group_prompts[group_id] = prompt[: state.settings.max_chars]
@@ -1699,13 +1710,20 @@ def main() -> None:
     app.bot.set_my_commands(group_commands, scope=BotCommandScopeAllChatAdministrators())
     
     only_private = private()
-    commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
-                "status": status, "metrics": metrics, "ratelimit": ratelimit, "reset": reset, "history": history,
+    # Private-only commands (admin/user)
+    private_commands = {"start": start, "approve": approve, "reject": reject, "revoke": revoke, "users": users,
+                "status": status, "metrics": metrics, "ratelimit": ratelimit,
                 "addglobalprompt": addglobalprompt, "addprivateprompt": addprivateprompt,
-                "setgroupprompt": setgroupprompt, "cleargroupprompt": cleargroupprompt, "showgroupprompt": showgroupprompt,
                 "shutdown": shutdown, "help": help_command, "usage": usage, "resilience": resilience_status}
-    for name, callback in commands.items():
+    for name, callback in private_commands.items():
         app.add_handler(CommandHandler(name, callback, filters=only_private))
+    # Commands that work in both private and group chats (reset, history)
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("history", history))
+    # Group prompt commands - can be used in private with group_id arg
+    app.add_handler(CommandHandler("setgroupprompt", setgroupprompt))
+    app.add_handler(CommandHandler("cleargroupprompt", cleargroupprompt))
+    app.add_handler(CommandHandler("showgroupprompt", showgroupprompt))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Group chat message handler (supports group and supergroup types)
