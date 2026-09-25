@@ -1101,12 +1101,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state.request_semaphore.release()
     except (ProviderTimeoutError, RuntimeError, HTTPClientError):
         state.failed_requests += 1
-        # Remove the exact dict object we appended (identity-based, survives other deletions)
-        try:
-            state.history[user_id].remove(user_msg_dict)
-        except ValueError:
-            # Message was already removed by another concurrent failure
-            pass
+        # Remove the exact dict object we appended (identity-based, survives identical messages)
+        for index, message in enumerate(state.history[user_id]):
+            if message is user_msg_dict:
+                del state.history[user_id][index]
+                break
         log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await state.persist()
