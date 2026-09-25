@@ -10,6 +10,7 @@ import random
 import sys
 import tempfile
 import time
+import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -112,6 +113,7 @@ class CircuitBreaker:
     success_threshold: int = 2
     cooldown_seconds: float = 60.0
     half_open_max_requests: int = 2
+    lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
 
     def __post_init__(self):
         # Ensure half_open_max_requests equals success_threshold for proper recovery
@@ -125,18 +127,26 @@ class CircuitBreaker:
     _half_open_requests: int = 0
 
     def record_success(self) -> None:
-        if self._state == CircuitState.HALF_OPEN:
-            self._success_count += 1
-            if self._success_count >= self.success_threshold:
-                self._close()
+        with self.lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.success_threshold:
+                    self._close()
+            elif self._state in (CircuitState.CLOSED, CircuitState.OPEN):
+                # Reset failure count on success in CLOSED or OPEN state to prevent
+                # slow accumulation of failures (e.g., 5 isolated failures separated by
+                # hundreds of successes could open the circuit)
+                self._failure_count = 0
+                self._last_failure_time = None
 
     def record_failure(self) -> None:
-        self._failure_count += 1
-        self._last_failure_time = time.time()
-        if self._state == CircuitState.CLOSED and self._failure_count >= self.failure_threshold:
-            self._open()
-        elif self._state == CircuitState.HALF_OPEN:
-            self._open()
+        with self.lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._state == CircuitState.CLOSED and self._failure_count >= self.failure_threshold:
+                self._open()
+            elif self._state == CircuitState.HALF_OPEN:
+                self._open()
 
     def _open(self) -> None:
         self._state = CircuitState.OPEN
@@ -1065,6 +1075,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     state.total_requests += 1
     state.user_request_count[user_id] += 1
+    user_msg_index = len(state.history[user_id])
     state.history[user_id].append({"role": "user", "content": text})
     await state.persist()
     try:
@@ -1080,7 +1091,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             state.request_semaphore.release()
     except (ProviderTimeoutError, RuntimeError, HTTPClientError):
         state.failed_requests += 1
-        state.history[user_id].pop()
+        # Remove the user message we added (at user_msg_index), preserving any concurrent messages
+        if len(state.history[user_id]) > user_msg_index:
+            del state.history[user_id][user_msg_index]
         log_provider_failure(provider, "http_error" if isinstance(sys.exc_info()[1], HTTPClientError) else "unknown")
         logger.exception("llama.cpp request failed for user %s", user_id)
         await state.persist()
