@@ -1,107 +1,178 @@
 # Group Chat Support Design
 
 ## Overview
-Extend the Telegram bot to optionally handle messages in allowed groups, with per-group permissions and @mention prefix support.
+Extended Telegram bot with full group chat support, including per-group state, group-scoped prompts, and configurable access policies.
 
-## Requirements
+## Environment Variables
 
-### Environment Variables
+### Group Configuration
 - `TELEGRAM_ALLOWED_GROUP_IDS` - Comma-separated group chat IDs (optional, empty = group chat disabled)
+- `GROUP_ACCESS_MODE` - Group access policy: `all` (any user), `approved_users` (must be registered), or `admins` (admin-only). Default: `all`
 - `TELEGRAM_ADMIN_USER_IDS` - Comma-separated Telegram user IDs that can manage group permissions
 
-### Features
-1. **Group message filtering**: Only process messages from allowed groups
-2. **@mention botname**: In group chats, messages must mention the bot (e.g., @telegram-bot) to trigger responses
-3. **Per-group state**: Conversation history and usage counters per (user, group) pair
-4. **Group-specific registration**: Groups need approval before the bot can respond in them via `/startgroup`
-5. **Admin commands**: Only `TELEGRAM_ADMIN_USER_IDS` users can manage group permissions
+### Logging
+- `TELEGRAM_BOT_LOG_DIR` - Log directory. Default: `~/.local/state/telegram-chat-bot/logs` (override with `/mnt/scratch/hermes/logs` on compute01)
 
-### Security Considerations
-- Group chats are inherently less secure than private messages
-- No direct messages to the bot in groups (must use @mention)
-- Admin commands in groups require explicit admin user ID validation
+## Features
 
-## Architecture Changes
+### 1. Group Message Filtering
+- Only process messages from allowed groups (static allowlist OR approved registration)
+- Supports both `TELEGRAM_ALLOWED_GROUP_IDS` and group registration workflow
+- Silent ignore for disallowed groups
+
+### 2. Per-Group State
+- Conversation history stored per `(user_id, group_id)` tuple
+- Private history: `user_id` only (group_id=None)
+- Group history: `(user_id, group_id)` tuple
+- State persistence in JSON files
+
+### 3. Group-Scoped Prompts
+- Separate prompt storage: `global_prompt`, `private_prompts[user_id]`, `group_prompts[group_id]`
+- Group requests use `global_prompt + group_prompt[group_id]` (never private prompt)
+- Private requests use `global_prompt + private_prompt[user_id]`
+
+### 4. Group Registration System
+- `/startgroup <group_id>` - Admin requests to add bot to group (private)
+- `/approvegroup <group_id>` - Admin approves group access
+- `/rejectgroup <group_id>` - Admin rejects group access
+- `/revokegroup <group_id>` - Admin removes group access
+- `/groupusers` - List approved groups (admin only)
+
+### 5. Group Prompt Management (Admin Only)
+- `/setgroupprompt <group_id> <prompt>` - Set prompt for specific group (private or in-group)
+- `/showgroupprompt <group_id>` - View group prompt
+- `/cleargroupprompt <group_id>` - Clear group prompt
+
+### 6. Group Context Commands
+- `/reset` - Reset conversation context (works in both private and group chats)
+- `/history` - Show message count (works in both private and group chats)
+- Per-user group history isolation
+
+### 7. Configurable Group Access Policy
+- `GROUP_ACCESS_MODE=all` - Any user can use approved groups (default)
+- `GROUP_ACCESS_MODE=approved_users` - Only registered users can use groups
+- `GROUP_ACCESS_MODE=admins` - Only bot administrators can use groups
+- Validation: Invalid modes raise `ValueError` at startup
+
+## Architecture
 
 ### Data Model
 ```python
 class State:
-    # Current: user_id -> list[dict]
-    # New: (user_id, group_id) -> list[dict]  # group_id = None for private
+    # History: user_id -> deque for private, (user_id, group_id) -> deque for groups
+    history: dict[int | tuple[int, int], deque[dict[str, str]]]
     
-    def get_history(self, user_id: int, group_id: Optional[int] = None) -> List[dict]
-    def append_history(self, user_id: int, message: dict, group_id: Optional[int] = None) -> None
-    def clear_history(self, user_id: int, group_id: Optional[int] = None) -> None
+    # Prompts
+    global_prompt: str
+    private_prompts: dict[int, str]        # user_id -> prompt
+    group_prompts: dict[int, str]          # group_id -> prompt
+    
+    # Registration stores
+    user_registrations: RegistrationStore
+    group_registrations: RegistrationStore  # Separate store for groups
 ```
 
-### Message Handler
+### State Key Format
+- Private: `user_id` (int)
+- Group: `(user_id, group_id)` (tuple[int, int])
+- Serialization: `user_key_str` = `user_id` or `"user_id:group_id"`
+
+### Prompt Selection Logic
 ```python
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Determine if group or private
-    group_id = update.effective_message.chat.id if update.effective_message.chat.type == Chat.GROUP else None
-    
-    # Check if group is allowed (skip if private)
-    if group_id and group_id not in get_allowed_groups():
-        return  # Silent ignore
-    
-    # Check @mention requirement for groups
-    if group_id:
-        if not has_mention_botname(update.effective_message, bot_username):
-            return  # Silent ignore in groups
+def messages(self, user_id: int, group_id: int | None = None) -> list[dict]:
+    prompt = self.global_prompt
+    if group_id is not None:
+        # Group request: use group prompt, never private prompt
+        if self.group_prompts.get(group_id):
+            prompt = f"{prompt}\n{self.group_prompts[group_id]}".strip()
     else:
-        # Private chat: no @mention required
-        pass
-    
-    # Rest of handler unchanged (allows, rate limiting, etc.)
+        # Private request: use private prompt
+        if self.private_prompts.get(user_id):
+            prompt = f"{prompt}\n{self.private_prompts[user_id]}".strip()
+    return [{"role": "system", "content": prompt}] + self.history[key]
 ```
 
-### Group Registration Flow
-1. Admin sends `/startgroup <group_id>` privately (admin-only command)
-2. Bot creates pending group registration (stored in `registrations.json` with group ID)
-3. Admin approves via `/approvegroup <group_id>`
-4. Bot starts responding in that group
+### Group Authorization
+```python
+def allowed_group(self, group_id: int, user_id: int | None = None) -> bool:
+    mode = self.settings.group_access_mode
+    
+    if group_id in self.settings.allowed_group_ids or \
+       self.group_registrations.status(group_id) == "approved":
+        if mode == "all":
+            return True  # Any user allowed
+        elif mode == "approved_users":
+            return self.allowed(user_id) if user_id else False
+        elif mode == "admins":
+            return self.admin(user_id) if user_id else False
+        return user_id is not None  # Fail closed for restricted modes
+    
+    return False
+```
 
-### Commands (Group Context)
-- `/startgroup <group_id>` - Admin sends this command privately to request adding bot to a group
-- `/approvegroup <group_id>` - Admin approves group access
-- `/rejectgroup <group_id>` - Admin rejects group access
-- `/revokegroup <group_id>` - Admin removes group access
-- `/groupusers` - List groups bot is registered in
-- `/groupstatus <group_id>` - Show group-specific stats
+## Command Registration
 
-## Implementation Plan
+### Private-Only Commands (filtered)
+- `/start`, `/approve`, `/reject`, `/revoke`, `/users` - Registration management
+- `/status`, `/metrics`, `/ratelimit`, `/usage`, `/resilience` - System info
+- `/addglobalprompt`, `/addprivateprompt` - Prompt management
+- `/shutdown`, `/help` - Utilities
 
-### Phase 1: Core Support
-1. Update `State` class to handle (user_id, group_id) tuples
-2. Add `TELEGRAM_ALLOWED_GROUP_IDS` validation
-3. Modify `handle_message` to check group allowlist
-4. Add @mention prefix detection for groups
+### Universal Commands (no filter)
+- `/reset` - Clear context (private or group)
+- `/history` - Show history count (private or group)
 
-### Phase 2: Registration System
-1. Extend `RegistrationStore` to handle group IDs
-2. Add `/startgroup` handler
-3. Add `/approvegroup`, `/rejectgroup`, `/revokegroup` handlers
-4. Update `/users` to show group registrations
+### Group Prompt Commands (no filter)
+- `/setgroupprompt` - Works in private with `<group_id> <prompt>` or in-group with `<prompt>`
+- `/showgroupprompt <group_id>` - Always requires group_id
+- `/cleargroupprompt <group_id>` - Always requires group_id
 
-### Phase 3: Admin Commands
-1. Add group admin command handlers (`/groupusers`, `/groupstatus`)
-2. Implement per-group usage statistics
-3. Add @mention prefix enforcement option
+## Implementation Checklist
 
-### Phase 4: Testing
-1. Mock group chat messages in tests
-2. Test group allowlist filtering
-3. Test @mention botname detection (not prefix)
-4. Test group registration workflow
+### Phase 1: Core Support ✅
+- [x] Update `State` class to handle `(user_id, group_id)` tuples
+- [x] Add `TELEGRAM_ALLOWED_GROUP_IDS` validation
+- [x] Modify `handle_message` to check group allowlist
+- [x] Add @mention botname detection for groups
 
-## Open Questions
+### Phase 2: Registration System ✅
+- [x] Extend `RegistrationStore` to handle group IDs
+- [x] Add `/startgroup` handler
+- [x] Add `/approvegroup`, `/rejectgroup`, `/revokegroup` handlers
+- [x] Update `/users` to show group registrations (separate from users)
+- [x] Add `/groupusers` command to list group registrations
 
-1. Should @mention be mandatory in groups? (default: yes)
-2. Should the bot respond to @all/@everyone mentions? (default: no for security)
-3. How to handle group admins vs bot admin permissions?
-4. Should groups have separate rate limits from private messages?
+### Phase 3: Group Context & Prompts ✅
+- [x] Extend `/reset` to work in groups with per-user context
+- [x] Extend `/history` to work in groups with per-user context
+- [x] Add `group_prompts` dict to State
+- [x] Add `/setgroupprompt`, `/showgroupprompt`, `/cleargroupprompt` commands
+- [x] Update `messages()` to use group prompts for group requests
+- [x] Ensure private prompts never leak into group requests
+
+### Phase 4: Access Policy & Polish ✅
+- [x] Add `GROUP_ACCESS_MODE` setting with validation
+- [x] Update `allowed_group()` to enforce access modes
+- [x] Register Telegram native command menu for all scopes
+- [x] Improve user-facing error messages (timeouts, HTTP errors, failures)
+- [x] Add test coverage for all group features
+
+## Test Coverage
+- `tests/test_issue33_prompts.py` - Private prompts isolation tests
+- `tests/test_issue38_group_reset_history.py` - Group command reachability tests
+- `tests/test_issue34_group_access_mode.py` - GROUP_ACCESS_MODE validation tests
+
+## Security Considerations
+- Group chats are inherently less secure than private messages
+- No direct messages to the bot in groups (must use @mention)
+- Admin commands require explicit `TELEGRAM_ADMIN_USER_IDS` validation
+- Group prompts only affect group requests, never private chats
+- Access modes fail closed: `approved_users`/`admins` modes require `user_id` parameter
 
 ## Related Files
-- `telegram_chat_bot.py` - Main bot logic
+- `telegram_chat_bot.py` - Main bot logic with group support
 - `tests/test_bot.py` - Existing bot tests
-- `tests/` - New test files for group chat functionality
+- `tests/test_issue33_prompts.py` - Private prompts isolation tests
+- `tests/test_issue38_group_reset_history.py` - Group command tests
+- `tests/test_issue34_group_access_mode.py` - Access mode tests
+- `ISSUES.md` - Issue tracking and status
