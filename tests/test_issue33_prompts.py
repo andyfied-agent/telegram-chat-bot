@@ -12,7 +12,7 @@ class TestPrivatePromptsIsolation:
     
     def test_group_without_group_prompt_no_private_prompt(self):
         """Group chat without group prompt should NOT include user's private prompt."""
-        settings = Settings()
+        settings = Settings(token="fake_token")
         state = State(settings)
         
         # Set user's private prompt
@@ -29,7 +29,7 @@ class TestPrivatePromptsIsolation:
     
     def test_group_with_group_prompt_uses_group_prompt(self):
         """Group chat with group prompt should use group prompt, not private prompt."""
-        settings = Settings()
+        settings = Settings(token="fake_token")
         state = State(settings)
         
         # Set both group and private prompts
@@ -48,7 +48,7 @@ class TestPrivatePromptsIsolation:
     
     def test_private_chat_uses_private_prompt(self):
         """Private chat should still use private prompt."""
-        settings = Settings()
+        settings = Settings(token="fake_token")
         state = State(settings)
         
         state.private_prompts[123] = "You are a helpful assistant."

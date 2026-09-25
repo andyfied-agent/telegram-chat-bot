@@ -13,7 +13,7 @@ A Telegram chat bot backed by a local llama.cpp (Ministral) server that responds
 - System prompt support: global and per-user private prompts
 - Rate limiting between model requests (per-user cooldown)
 - **Concurrent request limiting** via MAX_CONCURRENT_REQUESTS setting
-- **Central logging** to rotating file at /mnt/scratch/hermes/logs/telegram-chat-bot.log
+- **Central logging** to rotating file at `~/.local/state/telegram-chat-bot/logs/telegram-chat-bot.log` (override with `TELEGRAM_BOT_LOG_DIR=/mnt/scratch/hermes/logs` on compute01)
 - **Metrics tracking** via /metrics command
 - **Rate-limit visibility** via /ratelimit command
 - Response chunking: long model outputs (> 4096 chars) are automatically split into Telegram-compatible chunks
@@ -57,7 +57,7 @@ Set the following environment variables (documented in .env.example):
 - MAX_MESSAGE_CHARS -- Max characters per message and max model response length. Default: 8000. Response chunks are capped at 4096 characters (Telegram API limit).
 - MODEL_REQUEST_INTERVAL -- Minimum seconds between requests per user. Default: 1.0.
 - MAX_CONCURRENT_REQUESTS -- Maximum concurrent model requests allowed. Default: 2. Set to 1 for strict serialization.
-- TELEGRAM_BOT_LOG_DIR -- Log directory for rotating file handler. Default: /mnt/scratch/hermes/logs.
+- TELEGRAM_BOT_LOG_DIR -- Log directory for rotating file handler. Default: ~/.local/state/telegram-chat-bot/logs (override with /mnt/scratch/hermes/logs on compute01).
 
 ## Numeric Setting Validation
 
@@ -173,7 +173,7 @@ To protect the llama.cpp server from overload, the bot limits concurrent model r
 
 ## Central Logging
 
-All bot activity is logged to `/mnt/scratch/hermes/logs/telegram-chat-bot.log` with rotating file handler (10MB per file, 5 backups). Logs include request timestamps, errors, and provider failures.
+All bot activity is logged to `~/.local/state/telegram-chat-bot/logs/telegram-chat-bot.log` with rotating file handler (10MB per file, 5 backups). Logs include request timestamps, errors, and provider failures. Override with `TELEGRAM_BOT_LOG_DIR=/mnt/scratch/hermes/logs` on compute01.
 
 
 ## Tests

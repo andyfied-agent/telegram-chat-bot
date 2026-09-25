@@ -12,18 +12,18 @@ class TestGroupAccessModeValidation:
     def test_valid_modes_accepted(self):
         """All valid modes should be accepted."""
         for mode in ["all", "approved_users", "admins"]:
-            settings = Settings(group_access_mode=mode)
+            settings = Settings(token="fake_token", group_access_mode=mode)
             assert settings.group_access_mode == mode
     
     def test_invalid_mode_rejected(self):
         """Invalid modes should raise ValueError."""
         with pytest.raises(ValueError, match="Invalid GROUP_ACCESS_MODE"):
-            Settings(group_access_mode="invalid_mode")
+            Settings(token="fake_token", group_access_mode="invalid_mode")
     
     def test_invalid_mode_message(self):
         """Error message should list valid options."""
         with pytest.raises(ValueError) as exc_info:
-            Settings(group_access_mode="random")
+            Settings(token="fake_token", group_access_mode="random")
         assert "all" in str(exc_info.value)
         assert "approved_users" in str(exc_info.value)
         assert "admins" in str(exc_info.value)
@@ -34,7 +34,7 @@ class TestGroupAccessModeEnforcement:
     
     def test_all_mode_any_user(self):
         """In 'all' mode, any user should be able to use approved groups."""
-        settings = Settings(group_access_mode="all")
+        settings = Settings(token="fake_token", group_access_mode="all")
         state = State(settings)
         state.group_registrations.set_status(456, "approved")
         
@@ -45,7 +45,7 @@ class TestGroupAccessModeEnforcement:
     
     def test_approved_users_mode_requires_approval(self):
         """In 'approved_users' mode, only approved users should be allowed."""
-        settings = Settings(group_access_mode="approved_users", allowed_user_ids=frozenset([123]))
+        settings = Settings(token="fake_token", group_access_mode="approved_users", allowed_user_ids=frozenset([123]))
         state = State(settings)
         state.group_registrations.set_status(456, "approved")
         
@@ -58,7 +58,7 @@ class TestGroupAccessModeEnforcement:
     
     def test_admins_mode_requires_admin(self):
         """In 'admins' mode, only admins should be allowed."""
-        settings = Settings(group_access_mode="admins", admin_user_ids=frozenset([123]))
+        settings = Settings(token="fake_token", group_access_mode="admins", admin_user_ids=frozenset([123]))
         state = State(settings)
         state.group_registrations.set_status(456, "approved")
         

@@ -28,7 +28,7 @@ class TestGroupResetHistoryReachability:
         )
         
         # Create mock context
-        state = State(Settings())
+        state = State(Settings(token="fake_token"))
         state.group_registrations.set_status(456, "approved")
         context = MagicMock(
             application=MagicMock(
@@ -62,7 +62,7 @@ class TestGroupResetHistoryReachability:
         )
         
         # Create mock context
-        state = State(Settings())
+        state = State(Settings(token="fake_token"))
         state.group_registrations.set_status(456, "approved")
         state.history[(123, 456)] = [
             {"role": "user", "content": "hello"},
