@@ -45,6 +45,13 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Users can see whether a request is slow because of queueing, model generation, or provider fallback.
 **Acceptance:** Report a stable human-readable duration for successful and failed model requests, use a monotonic timer, and cover the formatting and failure paths with tests.
 
+### 45. Telegram-Compatible Response Markup
+**Status:** Open
+**Description:** Some bot responses use Markdown that does not match Telegram's supported parsing rules, producing malformed formatting or visible markup.
+**Solution:** Choose and consistently apply one Telegram-supported parse mode, escape dynamic model output correctly, and fall back to plain text when formatting cannot be represented safely.
+**Impact:** Replies render consistently in private and group chats without broken entities, accidental formatting, or failed sends.
+**Acceptance:** Add tests for headings, emphasis, code, links, underscores, brackets, user/model-generated text, long messages, and formatting failures; verify a safe plain-text fallback.
+
 ### 7. Group Chat Support
 **Status:** Complete  
 **Description:** Added optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
@@ -132,13 +139,13 @@ The following GitHub issues have been addressed:
 |||| Category | Total | Complete | Remaining |
 ||||----------|-------|----------|-----------|
 |||| High Priority | 1 | 1 | 0 |
-|||| Medium Priority | 5 | 3 | 2 |
+|||| Medium Priority | 6 | 3 | 3 |
 |||| Low Priority | 8 | 8 | 0 |
-|||| **Total** | **14** | **12** | **2** |
+|||| **Total** | **15** | **12** | **3** |
 
 **Test Coverage:** 184/184 tests passing, Ruff clean
 
-**Next Action:** Implement issues #42 and #43 (184/184 tests passing, Ruff clean before these changes).
+**Next Action:** Implement issues #42, #43, and #45 (184/184 tests passing, Ruff clean before these changes).
 
 ---
 
