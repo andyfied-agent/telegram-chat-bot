@@ -55,7 +55,7 @@ Set the following environment variables (documented in .env.example):
 - TELEGRAM_ALLOWED_USER_IDS -- Comma-separated Telegram numeric user IDs. If unset or empty, all Telegram users are rejected.
 - TELEGRAM_ADMIN_USER_IDS -- Comma-separated Telegram numeric user IDs with authority to change the global prompt and manage registrations. If unset or empty, admin commands are denied to all users.
 - TELEGRAM_REGISTRATION_FILE -- JSON registration store. Default: ~/.local/state/telegram-chat-bot/registrations.json.
-- LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:8081/v1.
+- LLAMA_CPP_BASE_URL -- Base URL of the llama.cpp / OAI-compatible API. Default: http://127.0.0.1:11438/v1.
 - LLAMA_CPP_MODEL -- Model name. Default: ministral-3-3b-64k-q4_k_m.gguf.
 - LLAMA_CPP_TIMEOUT -- HTTP timeout in seconds. Default: 120.
 - MAX_CONTEXT_MESSAGES -- Max conversation history messages per user. Default: 20.

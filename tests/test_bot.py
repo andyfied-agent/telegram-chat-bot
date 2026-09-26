@@ -35,7 +35,7 @@ def test_settings_defaults():
     # Test default settings
     settings = Settings(token='test_token')
     assert settings.token == 'test_token'
-    assert settings.base_url == 'http://127.0.0.1:8081/v1'
+    assert settings.base_url == 'http://127.0.0.1:11438/v1'
     assert settings.model == 'ministral-3-3b-64k-q4_k_m.gguf'
     assert settings.timeout == 120.0
     assert settings.max_messages == 20
