@@ -114,7 +114,7 @@ class TestHealthCommand:
     @pytest.fixture
     def mock_settings(self):
         settings = MagicMock()
-        settings.base_url = "http://127.0.0.1:8081/v1"
+        settings.base_url = "http://127.0.0.1:11438/v1"
         settings.timeout = 120.0
         settings.model = "test-model.gguf"
         return settings
