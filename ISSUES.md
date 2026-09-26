@@ -31,6 +31,27 @@ This file tracks outstanding issues for the Telegram Chat Bot project.
 **Impact:** Operational monitoring and troubleshooting.  
 **Implementation:** ✅ Complete - Shows total/successful/failed requests, success rate, avg response time, concurrent limit.
 
+### 42. Show Active Model and Provider in Responses
+**Status:** Open
+**Description:** Model-backed Telegram replies do not identify which provider and model produced the response.
+**Solution:** Add non-secret provider and model metadata to the user-facing response, using the actual configured request route rather than a hard-coded label.
+**Impact:** Users can distinguish GTX broker replies from other providers and diagnose unexpected routing or model changes.
+**Acceptance:** Include the provider and model name without exposing tokens, local credentials, or unnecessary filesystem paths; cover private and group replies with tests.
+
+### 43. Show Reply Duration
+**Status:** Open
+**Description:** Telegram replies do not show how long the bot took to process the request.
+**Solution:** Measure elapsed time from request dispatch to completed response and include a concise duration in the reply or response metadata.
+**Impact:** Users can see whether a request is slow because of queueing, model generation, or provider fallback.
+**Acceptance:** Report a stable human-readable duration for successful and failed model requests, use a monotonic timer, and cover the formatting and failure paths with tests.
+
+### 45. Telegram-Compatible Response Markup
+**Status:** Open
+**Description:** Some bot responses use Markdown that does not match Telegram's supported parsing rules, producing malformed formatting or visible markup.
+**Solution:** Choose and consistently apply one Telegram-supported parse mode, escape dynamic model output correctly, and fall back to plain text when formatting cannot be represented safely.
+**Impact:** Replies render consistently in private and group chats without broken entities, accidental formatting, or failed sends.
+**Acceptance:** Add tests for headings, emphasis, code, links, underscores, brackets, user/model-generated text, long messages, and formatting failures; verify a safe plain-text fallback.
+
 ### 7. Group Chat Support
 **Status:** Complete  
 **Description:** Added optional group chat support with `TELEGRAM_ALLOWED_GROUP_IDS`, per-group permissions, @mention prefix.  
@@ -118,15 +139,15 @@ The following GitHub issues have been addressed:
 |||| Category | Total | Complete | Remaining |
 ||||----------|-------|----------|-----------|
 |||| High Priority | 1 | 1 | 0 |
-|||| Medium Priority | 4 | 4 | 0 |
-|||| Low Priority | 9 | 9 | 0 |
-|||| **Total** | **14** | **14** | **0** |
+|||| Medium Priority | 6 | 3 | 3 |
+|||| Low Priority | 8 | 8 | 0 |
+|||| **Total** | **15** | **12** | **3** |
 
 **Test Coverage:** 184/184 tests passing, Ruff clean
 
-**Next Action:** All tracked issues complete. PR #44 ready for review (184/184 tests passing, Ruff clean).
+**Next Action:** Implement issues #42, #43, and #45 (184/184 tests passing, Ruff clean before these changes).
 
 ---
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-26
 **Bot version:** Latest (184/184 tests passing, Ruff clean)
